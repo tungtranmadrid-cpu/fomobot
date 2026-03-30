@@ -10,6 +10,7 @@ import json
 import os
 import re
 import logging
+import secrets
 import unicodedata
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,10 +20,12 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Bot, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
+    ConversationHandler,
     MessageHandler,
     TypeHandler,
     ContextTypes,
@@ -90,9 +93,21 @@ GCALENDAR_TZ = (
 GOOGLE_SERVICE_ACCOUNT_JSON = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip() or None
 GOOGLE_OAUTH_CLIENT_ID = (os.getenv("GOOGLE_OAUTH_CLIENT_ID") or "").strip() or None
 GOOGLE_OAUTH_CLIENT_SECRET = (os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip() or None
+# Lịch công ty gom về một Gmail: đọc calendar của tài khoản này, lọc sự kiện theo email_congty từng user
+GCAL_MASTER_EMAIL = (os.getenv("GCAL_MASTER_EMAIL") or "tungtrantmct@gmail.com").strip()
+GCAL_MASTER_REFRESH_TOKEN = (os.getenv("GCAL_MASTER_REFRESH_TOKEN") or "").strip() or None
 DAILY_CALENDAR_HOUR = max(0, min(23, int(os.getenv("DAILY_CALENDAR_HOUR", "7"))))
 DAILY_CALENDAR_MINUTE = max(0, min(59, int(os.getenv("DAILY_CALENDAR_MINUTE", "0"))))
 SUPABASE_USER_TABLE = (os.getenv("SUPABASE_USER_TABLE") or "user").strip() or "user"
+SUPABASE_MEMBERS_TABLE = (os.getenv("SUPABASE_MEMBERS_TABLE") or "members").strip() or "members"
+# Email không hiển thị trong chi tiết cuộc họp (phân tách bằng dấu phẩy); mặc định tài khoản nội bộ
+MEETING_HIDE_EMAILS_RAW = (os.getenv("MEETING_HIDE_EMAILS") or "tungtrantmct@gmail.com").strip()
+# Giá trị mặc định khi duyệt đăng ký (/dk); có thể ghi đè bằng biến môi trường
+DEFAULT_REGISTRATION_USEREMAIL = (
+    (os.getenv("DEFAULT_REGISTRATION_USEREMAIL") or "tungtrantmct@gmail.com").strip()
+)
+# Chỉ lấy từ .env — không hardcode token (push GitHub sẽ bị secret scanning chặn)
+DEFAULT_REGISTRATION_GCAL_REFRESH = (os.getenv("DEFAULT_REGISTRATION_GCAL_REFRESH_TOKEN") or "").strip()
 RAG_CHUNK_SIZE = max(100, min(2000, int(os.getenv("RAG_CHUNK_SIZE", "800"))))
 RAG_CHUNK_OVERLAP = max(0, min(200, int(os.getenv("RAG_CHUNK_OVERLAP", "100"))))
 RAG_TOP_K = max(1, min(20, int(os.getenv("RAG_TOP_K", "8"))))
@@ -108,6 +123,9 @@ MAX_QUERY_HISTORY = 10
 
 # Bật/tắt chế độ thinking (reasoning) theo user: chat_id -> True/False
 user_thinking: Dict[int, bool] = {}
+
+# Đăng ký /dk: hội thoại
+REG_USERNAME, REG_EMAIL = range(2)
 
 # Cache service account JSON cho Google Calendar
 _cached_sa: Optional[Dict[str, Any]] = None
@@ -303,12 +321,125 @@ def _build_google_calendar_oauth(refresh_token: str) -> Tuple[Any, Optional[str]
     return svc, None
 
 
-def fetch_calendar_events_for_day(
+def use_gcal_master_aggregator() -> bool:
+    """Đọc một calendar tập trung (GCAL_MASTER_*) rồi lọc theo email_congty."""
+    return bool(
+        (GCAL_MASTER_REFRESH_TOKEN or "").strip()
+        and GOOGLE_OAUTH_CLIENT_ID
+        and GOOGLE_OAUTH_CLIENT_SECRET
+    )
+
+
+def _event_email_norm(e: Optional[str]) -> str:
+    return (e or "").strip().lower()
+
+
+def filter_calendar_events_for_user_email(
+    events: List[Dict[str, Any]],
     user_email: str,
+) -> List[Dict[str, Any]]:
+    """
+    Giữ sự kiện mà user (email_congty) là người tổ chức, người tạo, hoặc có trong attendees.
+    Dùng khi toàn bộ lịch công ty được add vào một tài khoản Google (master).
+    """
+    target = _event_email_norm(user_email)
+    if not target or not events:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for ev in events:
+        eid = ev.get("id")
+        if eid and eid in seen:
+            continue
+        org = ev.get("organizer") or {}
+        if _event_email_norm(org.get("email")) == target:
+            if eid:
+                seen.add(eid)
+            out.append(ev)
+            continue
+        cr = ev.get("creator") or {}
+        if _event_email_norm(cr.get("email")) == target:
+            if eid:
+                seen.add(eid)
+            out.append(ev)
+            continue
+        for att in ev.get("attendees") or []:
+            if _event_email_norm(att.get("email")) == target:
+                if eid:
+                    seen.add(eid)
+                out.append(ev)
+                break
+    return out
+
+
+def _fetch_master_calendar_raw(
+    day: date,
+    display_tz: str,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Lấy toàn bộ sự kiện trong ngày trên calendar primary của tài khoản master (không lọc)."""
+    rt = (GCAL_MASTER_REFRESH_TOKEN or "").strip()
+    if not rt:
+        return None, "Thiếu GCAL_MASTER_REFRESH_TOKEN trong .env."
+    tz = ZoneInfo(display_tz)
+    start_local = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    time_min = start_local.isoformat()
+    time_max = end_local.isoformat()
+    try:
+        service, err = _build_google_calendar_oauth(rt)
+        if err or not service:
+            return None, err or "Không tạo được Google Calendar client (master)."
+        ev = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=time_min,
+                timeMax=time_max,
+                singleEvents=True,
+                orderBy="startTime",
+                maxResults=250,
+                timeZone=display_tz,
+            )
+            .execute()
+        )
+        return list(ev.get("items") or []), None
+    except Exception as e:
+        logger.exception("_fetch_master_calendar_raw: %s", e)
+        return None, str(e)
+
+
+def _calendar_id_for_list(
+    _calendar_owner_email: str,
+    _oauth_refresh_token: Optional[str],
+) -> str:
+    """
+    Luôn dùng calendarId=\"primary\" cho cả OAuth và Service Account.
+
+    - Service Account: đã gọi with_subject(email_congty) → primary = lịch chính user đó.
+    - OAuth: primary = lịch chính của **tài khoản Google đã cấp refresh token** (thường trùng
+      useremail). Không dùng email_congty làm calendarId — Google trả 404 nếu token không
+      có quyền truy cập calendar đó như một resource riêng. Cần lấy token từ đúng tài khoản
+      @medlatec.com (hoặc calendar được chia sẻ đủ quyền).
+    """
+    return "primary"
+
+
+def fetch_calendar_events_for_day(
+    calendar_owner_email: str,
     day: date,
     display_tz: str = "Asia/Ho_Chi_Minh",
     oauth_refresh_token: Optional[str] = None,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """
+    Chế độ master (GCAL_MASTER_REFRESH_TOKEN): đọc lịch tài khoản tập trung rồi lọc theo email_congty.
+    Chế độ cũ: OAuth per-user / Service Account impersonate email_congty.
+    """
+    if use_gcal_master_aggregator():
+        raw, err = _fetch_master_calendar_raw(day, display_tz)
+        if err or raw is None:
+            return None, err
+        return filter_calendar_events_for_user_email(raw, calendar_owner_email), None
+
     tz = ZoneInfo(display_tz)
     start_local = datetime.combine(day, datetime.min.time(), tzinfo=tz)
     end_local = start_local + timedelta(days=1)
@@ -322,17 +453,18 @@ def fetch_calendar_events_for_day(
         if rt:
             service, err = _build_google_calendar_oauth(rt)
         else:
-            if not (user_email or "").strip():
-                return None, "Thiếu useremail khi dùng Service Account (Google Workspace)."
-            service, err = _build_google_calendar_service_account(user_email)
+            if not (calendar_owner_email or "").strip():
+                return None, "Thiếu email_congty khi dùng Service Account (Google Workspace)."
+            service, err = _build_google_calendar_service_account(calendar_owner_email)
 
         if err or not service:
             return None, err or "Không tạo được Google Calendar client."
 
+        cal_id = _calendar_id_for_list(calendar_owner_email, oauth_refresh_token)
         ev = (
             service.events()
             .list(
-                calendarId="primary",
+                calendarId=cal_id,
                 timeMin=time_min,
                 timeMax=time_max,
                 singleEvents=True,
@@ -345,6 +477,45 @@ def fetch_calendar_events_for_day(
         return list(ev.get("items") or []), None
     except Exception as e:
         logger.exception("fetch_calendar_events_for_day: %s", e)
+        return None, str(e)
+
+
+def get_google_calendar_service(
+    calendar_owner_email: str,
+    oauth_refresh_token: Optional[str] = None,
+) -> Tuple[Any, Optional[str]]:
+    """Tạo client Calendar (OAuth hoặc Service Account) — dùng chung cho list/get sự kiện."""
+    if use_gcal_master_aggregator():
+        rt = (GCAL_MASTER_REFRESH_TOKEN or "").strip()
+        if rt:
+            return _build_google_calendar_oauth(rt)
+        return None, "Thiếu GCAL_MASTER_REFRESH_TOKEN."
+    rt = (oauth_refresh_token or "").strip()
+    if rt:
+        return _build_google_calendar_oauth(rt)
+    if not (calendar_owner_email or "").strip():
+        return None, "Thiếu email_congty khi dùng Service Account (Google Workspace)."
+    return _build_google_calendar_service_account(calendar_owner_email)
+
+
+def fetch_calendar_event_by_id(
+    calendar_owner_email: str,
+    oauth_refresh_token: Optional[str],
+    event_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Lấy một sự kiện đầy đủ (attendees, attachments, description, conferenceData)."""
+    service, err = get_google_calendar_service(calendar_owner_email, oauth_refresh_token)
+    if err or not service:
+        return None, err or "Không tạo được Google Calendar client."
+    eid = (event_id or "").strip()
+    if not eid:
+        return None, "Thiếu event id."
+    try:
+        cal_id = _calendar_id_for_list(calendar_owner_email, oauth_refresh_token)
+        ev = service.events().get(calendarId=cal_id, eventId=eid).execute()
+        return ev, None
+    except Exception as e:
+        logger.exception("fetch_calendar_event_by_id: %s", e)
         return None, str(e)
 
 
@@ -415,6 +586,392 @@ def format_day_schedule(
         lines.append(piece)
 
     return "\n".join(lines)
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\[\]\"']+")
+
+
+def _meeting_hidden_emails_set() -> set:
+    raw = (MEETING_HIDE_EMAILS_RAW or "").strip()
+    if not raw:
+        return set()
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def is_hidden_meeting_report_email(em: str) -> bool:
+    """Email không được đưa vào bất kỳ dòng nào của báo cáo chi tiết cuộc họp."""
+    return (em or "").strip().lower() in _meeting_hidden_emails_set()
+
+
+def fetch_members_by_emails(sb: Any, emails: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Tra bảng members theo email_congty (khớp email lịch).
+    Trả về dict[email.lower()] = row (có Họ và tên, Chức vụ, Nơi làm việc, ...).
+    """
+    seen: set = set()
+    uniq: List[str] = []
+    for e in emails:
+        e = (e or "").strip()
+        if not e or is_hidden_meeting_report_email(e):
+            continue
+        el = e.lower()
+        if el in seen:
+            continue
+        seen.add(el)
+        uniq.append(e)
+    out: Dict[str, Dict[str, Any]] = {}
+    if not uniq or not sb:
+        return out
+    try:
+        for i in range(0, len(uniq), 80):
+            batch = uniq[i : i + 80]
+            r = (
+                sb.table(SUPABASE_MEMBERS_TABLE)
+                .select("*")
+                .in_("email_congty", batch)
+                .execute()
+            )
+            for row in r.data or []:
+                ec = (row.get("email_congty") or "").strip()
+                if ec:
+                    out[ec.lower()] = row
+    except Exception as e:
+        logger.warning("fetch_members_by_emails: %s", e)
+    return out
+
+
+def _is_online_meeting_url(url: str) -> bool:
+    u = (url or "").lower()
+    needles = (
+        "meet.google.com",
+        "zoom.us",
+        "zoom.com",
+        "teams.microsoft.com",
+        "teams.live.com",
+        "webex.com",
+        "hangouts.google.com",
+        "gotomeeting.com",
+        "bluejeans.com",
+        "whereby.com",
+        "jitsi.org",
+        "meet.jit.si",
+        "duo.google.com",
+        "slack.com/call",
+        "meetings.hubspot",
+        "bigbluebutton.org",
+    )
+    return any(n in u for n in needles)
+
+
+def format_meeting_details_text(
+    ev: Dict[str, Any],
+    display_tz: str,
+    members_by_email: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> str:
+    """Trình bày chi tiết cuộc họp: giờ, thành phần (+ members), họp trực tuyến vs tài liệu."""
+    summary = (ev.get("summary") or "(Không tiêu đề)").strip()
+    lines: List[str] = [f"Cuộc họp / sự kiện: {summary}"]
+
+    try:
+        start = ev.get("start") or {}
+        if "date" in start and "dateTime" not in start:
+            d0 = str(start.get("date") or "")
+            lines.append(f"Thời gian: cả ngày {d0}")
+        else:
+            _is_all, st, en, loc = _parse_google_start_end(ev, display_tz)
+            if loc:
+                lines.append(
+                    f"Thời gian: {st.strftime('%d/%m/%Y %H:%M')} – {en.strftime('%H:%M')} ({display_tz}) — {loc}"
+                )
+            else:
+                lines.append(
+                    f"Thời gian: {st.strftime('%d/%m/%Y %H:%M')} – {en.strftime('%H:%M')} ({display_tz})"
+                )
+    except Exception:
+        lines.append("Thời gian: (không đọc được)")
+
+    attendees = ev.get("attendees") or []
+    lines.append("")
+    shown_any = False
+    if attendees:
+        lines.append("Thành phần tham gia:")
+        for a in attendees:
+            em = (a.get("email") or "").strip()
+            if is_hidden_meeting_report_email(em):
+                continue
+            shown_any = True
+            cal_name = (a.get("displayName") or "").strip()
+            mem = None
+            if members_by_email and em:
+                mem = members_by_email.get(em.lower())
+            ho_ten = (mem.get("Họ và tên") or "").strip() if mem else ""
+            chuc = (mem.get("Chức vụ") or "").strip() if mem else ""
+            noi = (mem.get("Nơi làm việc") or "").strip() if mem else ""
+            ten_hien = ho_ten or cal_name or "?"
+            if ho_ten and chuc and noi:
+                line = f"  • {ho_ten} — {chuc} — {noi}"
+            else:
+                line = f"  • {ten_hien}"
+            lines.append(line)
+        if not shown_any:
+            lines.append(
+                "  (Không hiển thị danh sách theo cấu hình ẩn email hoặc chỉ có email đã ẩn.)"
+            )
+    else:
+        lines.append(
+            "Thành phần tham gia: không có danh sách trên Google Calendar "
+            "(sự kiện cá nhân hoặc chưa mời qua Calendar)."
+        )
+
+    online_lines: List[str] = []
+    doc_lines: List[str] = []
+    seen_urls: set = set()
+
+    hangout = (ev.get("hangoutLink") or "").strip()
+    if hangout:
+        if hangout not in seen_urls:
+            seen_urls.add(hangout)
+            online_lines.append(f"  • Google Meet / Hangouts\n    {hangout}")
+
+    cd = ev.get("conferenceData") or {}
+    for ep in cd.get("entryPoints") or []:
+        uri = (ep.get("uri") or "").strip()
+        ep_type = (ep.get("entryPointType") or "").strip()
+        if not uri or uri in seen_urls:
+            continue
+        seen_urls.add(uri)
+        is_phone = uri.lower().startswith("tel:") or uri.lower().startswith("sip:") or ep_type == "phone"
+        if ep_type == "video" or _is_online_meeting_url(uri) or is_phone:
+            if ep_type == "video":
+                label = "Họp trực tuyến (video)"
+            elif is_phone:
+                label = "Gọi vào phòng (SIP/điện thoại)"
+            else:
+                label = "Họp trực tuyến"
+            online_lines.append(f"  • {label}\n    {uri}")
+        else:
+            doc_lines.append(f"  • Liên kết khác ({ep_type or 'mô tả'})\n    {uri}")
+
+    for att in ev.get("attachments") or []:
+        url = (att.get("fileUrl") or "").strip()
+        title = (att.get("title") or "Tài liệu đính kèm trên lịch").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        doc_lines.append(f"  • {title} (đính kèm Calendar)\n    {url}")
+
+    desc = (ev.get("description") or "").strip()
+    for m in _URL_IN_TEXT_RE.finditer(desc):
+        u = m.group(0).rstrip(").,;]")
+        if not u or u in seen_urls:
+            continue
+        seen_urls.add(u)
+        if _is_online_meeting_url(u):
+            online_lines.append(f"  • Link họp (trong mô tả)\n    {u}")
+        else:
+            doc_lines.append(f"  • Link / tài liệu (trong mô tả)\n    {u}")
+
+    lines.append("")
+    if online_lines:
+        lines.append("Họp trực tuyến (link tham gia):")
+        lines.extend(online_lines)
+    else:
+        lines.append("Họp trực tuyến: không thấy link Meet/Zoom/Teams hoặc tương đương trên sự kiện.")
+
+    lines.append("")
+    if doc_lines:
+        lines.append("Tài liệu cuộc họp (file đính kèm lịch & link tài liệu trong mô tả):")
+        lines.extend(doc_lines)
+    else:
+        lines.append(
+            "Tài liệu cuộc họp: không thấy file đính kèm hay link tài liệu (ngoài link họp trực tuyến). "
+            "Có thể bổ sung trên Google Calendar."
+        )
+
+    return "\n".join(lines)
+
+
+def resolve_day_for_meeting_query(user_text: str) -> date:
+    """Ngày trong câu hỏi chi tiết; nếu không ghi ngày thì mặc định hôm nay (theo GCALENDAR_TZ)."""
+    d, _ = resolve_day_keyword(user_text)
+    if d is not None:
+        return d
+    tz = ZoneInfo(GCALENDAR_TZ)
+    return datetime.now(tz).date()
+
+
+def is_meeting_detail_intent(user_text: str) -> bool:
+    """
+    Hỏi chi tiết cuộc họp: thành viên, tài liệu, đính kèm, link, ...
+    (khác với chỉ xem lịch trống/tóm tắt ngày).
+    """
+    val = (user_text or "").strip().lower()
+    normalized = unicodedata.normalize("NFD", val)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    detail_markers = (
+        "thanh vien",
+        "thanh phan",
+        "tham gia",
+        "tham du",
+        "nguoi tham",
+        "tai lieu",
+        "dinh kem",
+        "file dinh",
+        "link tai",
+        "tai lieu hop",
+        "attachment",
+        "chi tiet cuoc",
+        "thong tin cuoc hop",
+        "noi dung hop",
+        "ai tham gia",
+        "danh sach tham",
+        "co chua",
+        "da co",
+        "upload",
+    )
+    meeting_markers = (
+        "hop",
+        "cuoc hop",
+        "meeting",
+        "su kien",
+        "buoi hop",
+        "lich hop",
+        "calendar",
+        "event",
+    )
+    has_detail = any(d in normalized for d in detail_markers)
+    has_meeting = any(m in normalized for m in meeting_markers)
+    if has_detail and has_meeting:
+        return True
+    if "meeting attendee" in normalized or "meeting material" in normalized:
+        return True
+    return False
+
+
+def select_event_index_by_ai(user_question: str, events: List[Dict[str, Any]]) -> int:
+    """Chọn chỉ số sự kiện (0..n-1) khớp câu hỏi; -1 nếu không chọn được."""
+    if not events:
+        return -1
+    if len(events) == 1:
+        return 0
+    try:
+        client = get_openai_client()
+        titles = []
+        for i, ev in enumerate(events):
+            t = (ev.get("summary") or "(Không tiêu đề)").strip()
+            titles.append(f"{i + 1}. {t}")
+        system = (
+            "Bạn chọn đúng MỘT sự kiện trong danh sách khớp với câu hỏi người dùng về cuộc họp. "
+            "Chỉ trả lời MỘT số nguyên: số thứ tự (1, 2, 3...) hoặc 0 nếu không có sự kiện nào khớp. "
+            "Không giải thích thêm."
+        )
+        user = f"Câu hỏi:\n{user_question}\n\nDanh sách sự kiện trong ngày:\n" + "\n".join(titles)
+        resp = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        m = re.search(r"\b(\d+)\b", raw)
+        if not m:
+            return -1
+        n = int(m.group(1))
+        if n == 0:
+            return -1
+        if 1 <= n <= len(events):
+            return n - 1
+        return -1
+    except Exception as e:
+        logger.warning("select_event_index_by_ai: %s", e)
+        return -1
+
+
+async def answer_meeting_detail_question(update: Update, user_text: str) -> bool:
+    """Trả lời chi tiết cuộc họp (thành viên, tài liệu/link) từ Google Calendar."""
+    if not gcalendar_ready():
+        await update.message.reply_text("Google Calendar chưa sẵn sàng. Kiểm tra GOOGLE_* trong .env.")
+        return True
+    sb = get_supabase_client()
+    if not sb:
+        await update.message.reply_text("Chưa cấu hình Supabase.")
+        return True
+
+    chat_id = update.effective_chat.id
+    email, refresh, name, profile_err = get_user_calendar_profile(sb, chat_id)
+    if profile_err:
+        await update.message.reply_text(profile_err)
+        return True
+
+    target_day = resolve_day_for_meeting_query(user_text)
+    await update.message.chat.send_action("typing")
+
+    try:
+        events, err = await run_blocking(
+            fetch_calendar_events_for_day,
+            email or "",
+            target_day,
+            GCALENDAR_TZ,
+            refresh,
+        )
+    except Exception as e:
+        logger.exception("answer_meeting_detail_question fetch: %s", e)
+        await update.message.reply_text(f"Lấy lịch lỗi: {e}")
+        return True
+    if err:
+        await update.message.reply_text(f"Lấy lịch lỗi: {err}")
+        return True
+
+    ev_list = events or []
+    if not ev_list:
+        await update.message.reply_text(
+            f"Không có sự kiện nào trên Google Calendar ngày {target_day.strftime('%d/%m/%Y')} "
+            "để tra chi tiết."
+        )
+        return True
+
+    idx = select_event_index_by_ai(user_text, ev_list)
+    if idx < 0:
+        await update.message.reply_text(
+            "Không xác định được cuộc họp nào trong danh sách. "
+            "Hãy ghi rõ hơn tên cuộc họp hoặc thử trong ngày chỉ có một sự kiện."
+        )
+        return True
+
+    raw_ev = ev_list[idx]
+    eid = (raw_ev.get("id") or "").strip()
+    if not eid:
+        await update.message.reply_text("Sự kiện không có mã id — không lấy được chi tiết.")
+        return True
+
+    full_ev, gerr = await run_blocking(
+        fetch_calendar_event_by_id,
+        email or "",
+        refresh,
+        eid,
+    )
+    if gerr or not full_ev:
+        await update.message.reply_text(f"Không đọc chi tiết sự kiện: {gerr or 'unknown'}")
+        return True
+
+    attendee_emails: List[str] = []
+    for a in full_ev.get("attendees") or []:
+        em = (a.get("email") or "").strip()
+        if em and not is_hidden_meeting_report_email(em):
+            attendee_emails.append(em)
+    members_by_email: Dict[str, Dict[str, Any]] = {}
+    if attendee_emails:
+        members_by_email = await run_blocking(fetch_members_by_emails, sb, attendee_emails)
+
+    body = format_meeting_details_text(full_ev, GCALENDAR_TZ, members_by_email)
+    if name:
+        body = f"Chào {name},\n\n{body}"
+    if len(body) > 4000:
+        for i in range(0, len(body), 4000):
+            await update.message.reply_text(body[i : i + 4000])
+    else:
+        await update.message.reply_text(body)
+    return True
 
 
 # ======================= DB SCHEMA + SQL =======================
@@ -698,12 +1255,15 @@ def extract_keywords_from_question(client: OpenAI, question: str) -> List[str]:
 def get_user_calendar_profile(sb: Any, chat_id: int) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
     """
     Tìm profile lịch theo telegram chat_id.
-    Trả về: (email, refresh_token, display_name, error)
+    Trả về: (email_congty — lọc lịch / thành phần họp, refresh_token cho API, display_name, error).
+
+    Chế độ master (.env GCAL_MASTER_REFRESH_TOKEN): lịch đọc từ tài khoản GCAL_MASTER_EMAIL,
+    lọc theo email_congty; không cần gcal_refresh_token trên từng dòng user.
     """
     try:
         r = (
             sb.table(SUPABASE_USER_TABLE)
-            .select("useremail,gcal_refresh_token,Username,telegram_ID")
+            .select("useremail,gcal_refresh_token,Username,telegram_ID,email_congty")
             .eq("telegram_ID", str(chat_id))
             .limit(1)
             .execute()
@@ -715,30 +1275,39 @@ def get_user_calendar_profile(sb: Any, chat_id: int) -> Tuple[Optional[str], Opt
                 None,
                 "",
                 "Không thấy bạn trong bảng user (telegram_ID).\n\n"
-                "Chưa có lệnh đăng ký tự động — cần thêm tay trên Supabase:\n"
+                "Đăng ký tự động: trong chat riêng với bot gõ /dk (username + email công ty), chờ admin duyệt.\n"
+                "Hoặc thêm tay trên Supabase:\n"
                 "1) Gõ /id để xem Chat ID.\n"
                 "2) Dashboard → Table Editor → bảng user → Insert row.\n"
-                "3) Điền telegram_ID = đúng số từ /id (dạng text), thêm useremail; "
-                "nếu dùng OAuth Google thì điền gcal_refresh_token.",
+                "3) Điền telegram_ID, email_congty (để lọc lịch theo email công ty).",
             )
         row = rows[0] or {}
-        email = (row.get("useremail") or "").strip() or None
+        cal_email = (row.get("email_congty") or "").strip() or None
         refresh = (row.get("gcal_refresh_token") or "").strip() or None
         name = (row.get("Username") or "").strip()
-        if not refresh and not (GOOGLE_SERVICE_ACCOUNT_JSON and email):
+        if not cal_email:
             return (
-                email,
+                None,
+                refresh,
+                name,
+                "Thiếu email_congty trên bảng user — cần để lọc lịch theo email công ty.",
+            )
+        if use_gcal_master_aggregator():
+            mrt = (GCAL_MASTER_REFRESH_TOKEN or "").strip()
+            return cal_email, mrt or None, name, None
+        if not refresh and not (GOOGLE_SERVICE_ACCOUNT_JSON and cal_email):
+            return (
+                cal_email,
                 refresh,
                 name,
                 "Thiếu kết nối Google Calendar. Cần một trong hai:\n\n"
-                "• Workspace: trong .env có GOOGLE_SERVICE_ACCOUNT_JSON; "
-                "Admin Google ủy quyền domain cho service account (scope calendar.readonly); "
-                "trên Supabase dòng của bạn có useremail đúng email @côngty.\n\n"
-                "• Gmail cá nhân: trong .env có GOOGLE_OAUTH_CLIENT_ID và GOOGLE_OAUTH_CLIENT_SECRET (OAuth Web); "
-                "chạy get_gcal_refresh_token.py (redirect URI trong Console khớp GOOGLE_OAUTH_REDIRECT_URI), "
-                "dán refresh token vào cột gcal_refresh_token trên Supabase.",
+                "• Chế độ tập trung: trong .env đặt GCAL_MASTER_REFRESH_TOKEN (tài khoản "
+                f"{GCAL_MASTER_EMAIL or 'master'}) + GOOGLE_OAUTH_CLIENT_ID/SECRET.\n\n"
+                "• Workspace: GOOGLE_SERVICE_ACCOUNT_JSON + domain delegation; "
+                "email_congty = user cần đọc lịch.\n\n"
+                "• OAuth từng user: gcal_refresh_token trên Supabase.",
             )
-        return email, refresh, name, None
+        return cal_email, refresh, name, None
     except Exception as e:
         logger.exception("get_user_calendar_profile: %s", e)
         return None, None, "", str(e)
@@ -916,6 +1485,329 @@ async def answer_calendar_question(
     return True
 
 
+# ======================= ĐĂNG KÝ /DK =======================
+
+
+def _email_looks_valid(s: str) -> bool:
+    s = (s or "").strip()
+    if not s or "@" not in s or s.count("@") != 1:
+        return False
+    local, _, domain = s.partition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    return True
+
+
+def _pending_registrations(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
+    app = context.application
+    if app.bot_data is None:
+        app.bot_data = {}
+    reg = app.bot_data.setdefault("pending_registrations", {})
+    return reg
+
+
+def user_row_exists_for_telegram(sb: Any, chat_id: int) -> bool:
+    try:
+        r = (
+            sb.table(SUPABASE_USER_TABLE)
+            .select("id")
+            .eq("telegram_ID", str(chat_id))
+            .limit(1)
+            .execute()
+        )
+        return bool(r.data)
+    except Exception as e:
+        logger.warning("user_row_exists_for_telegram: %s", e)
+        return False
+
+
+def get_admin_telegram_chat_ids(sb: Any) -> List[int]:
+    """Danh sách chat_id (telegram_ID) của user có Role admin (không phân biệt hoa thường)."""
+    try:
+        r = sb.table(SUPABASE_USER_TABLE).select("telegram_ID,Role").execute()
+        rows = r.data or []
+        out: List[int] = []
+        seen = set()
+        for row in rows:
+            role = (row.get("Role") or "").strip().lower()
+            if role != "admin":
+                continue
+            cid = parse_telegram_chat_id(row.get("telegram_ID"))
+            if cid is not None and cid not in seen:
+                seen.add(cid)
+                out.append(cid)
+        return out
+    except Exception as e:
+        logger.warning("get_admin_telegram_chat_ids: %s", e)
+        return []
+
+
+def is_telegram_admin(sb: Any, user_telegram_id: int) -> bool:
+    return user_telegram_id in get_admin_telegram_chat_ids(sb)
+
+
+async def cmd_dk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Bắt đầu đăng ký: chỉ chat riêng, cần Supabase."""
+    if not update.message:
+        return ConversationHandler.END
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Chỉ dùng lệnh /dk trong chat riêng với bot.")
+        return ConversationHandler.END
+    sb = get_supabase_client()
+    if not sb:
+        await update.message.reply_text("Chưa cấu hình Supabase (SUPABASE_URL, SUPABASE_KEY).")
+        return ConversationHandler.END
+    chat_id = update.effective_chat.id
+    if user_row_exists_for_telegram(sb, chat_id):
+        await update.message.reply_text(
+            "Tài khoản Telegram của bạn đã có trong bảng user. Không cần đăng ký lại."
+        )
+        return ConversationHandler.END
+    admins = get_admin_telegram_chat_ids(sb)
+    if not admins:
+        await update.message.reply_text(
+            "Hệ thống chưa có admin (bảng user, cột Role = admin). Liên hệ quản trị."
+        )
+        return ConversationHandler.END
+    context.user_data.pop("reg_username", None)
+    await update.message.reply_text(
+        "Đăng ký tham gia hệ thống.\n\n"
+        "Bước 1/2: Gửi Username (tên hiển thị trong hệ thống).\n"
+        "Gõ /cancel để hủy."
+    )
+    return REG_USERNAME
+
+
+async def reg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message:
+        await update.message.reply_text("Đã hủy đăng ký.")
+    context.user_data.pop("reg_username", None)
+    return ConversationHandler.END
+
+
+async def reg_username(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return REG_USERNAME
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Username không được để trống. Nhập lại:")
+        return REG_USERNAME
+    context.user_data["reg_username"] = text
+    await update.message.reply_text("Bước 2/2: Gửi email công ty của bạn.")
+    return REG_EMAIL
+
+
+async def reg_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return REG_EMAIL
+    email = update.message.text.strip()
+    if not _email_looks_valid(email):
+        await update.message.reply_text("Email không hợp lệ. Nhập lại email công ty:")
+        return REG_EMAIL
+
+    sb = get_supabase_client()
+    if not sb:
+        await update.message.reply_text("Chưa cấu hình Supabase.")
+        return ConversationHandler.END
+
+    chat_id = update.effective_chat.id
+    if user_row_exists_for_telegram(sb, chat_id):
+        await update.message.reply_text("Bạn đã có trong bảng user. Không gửi yêu cầu mới.")
+        return ConversationHandler.END
+
+    admins = get_admin_telegram_chat_ids(sb)
+    if not admins:
+        await update.message.reply_text("Không tìm thấy admin để duyệt. Thử lại sau.")
+        return ConversationHandler.END
+
+    username = (context.user_data.get("reg_username") or "").strip()
+    context.user_data.pop("reg_username", None)
+
+    req_id = secrets.token_hex(8)
+    pending = _pending_registrations(context)
+    pending[req_id] = {
+        "status": "pending",
+        "chat_id": chat_id,
+        "Username": username,
+        "email_congty": email,
+    }
+
+    applicant = update.effective_user
+    applicant_label = (
+        f"@{applicant.username}" if applicant and applicant.username else ""
+    )
+    if applicant_label:
+        applicant_label = f" {applicant_label}"
+    admin_text = (
+        f"Yêu cầu đăng ký mới #{req_id}\n"
+        f"Telegram:{applicant_label}\n"
+        f"Chat ID: {chat_id}\n"
+        f"Username đề xuất: {username}\n"
+        f"Email công ty: {email}\n\n"
+        f"Duyệt hoặc từ chối bằng nút bên dưới."
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "Duyệt",
+                    callback_data=f"reg:approve:{req_id}",
+                ),
+                InlineKeyboardButton(
+                    "Từ chối",
+                    callback_data=f"reg:reject:{req_id}",
+                ),
+            ]
+        ]
+    )
+
+    sent = 0
+    for aid in admins:
+        try:
+            await context.bot.send_message(
+                chat_id=aid,
+                text=admin_text,
+                reply_markup=keyboard,
+            )
+            sent += 1
+        except Exception as e:
+            logger.warning("Gửi yêu cầu đăng ký tới admin %s: %s", aid, e)
+
+    if sent == 0:
+        pending.pop(req_id, None)
+        await update.message.reply_text(
+            "Không gửi được tin cho admin. Thử lại sau hoặc liên hệ quản trị."
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"Đã gửi yêu cầu đăng ký tới {sent} quản trị viên. "
+        "Bạn sẽ nhận thông báo khi có quyết định duyệt/từ chối."
+    )
+    return ConversationHandler.END
+
+
+async def registration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin bấm Duyệt / Từ chối trên tin nhắn yêu cầu đăng ký."""
+    query = update.callback_query
+    if not query:
+        return
+
+    sb = get_supabase_client()
+    if not sb:
+        await query.answer()
+        await query.edit_message_text("Lỗi: chưa cấu hình Supabase.")
+        return
+
+    admin_uid = update.effective_user.id if update.effective_user else None
+    if admin_uid is None or not is_telegram_admin(sb, admin_uid):
+        await query.answer("Bạn không có quyền duyệt đăng ký.", show_alert=True)
+        return
+
+    await query.answer()
+
+    data = (query.data or "").strip()
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "reg" or parts[1] not in ("approve", "reject"):
+        await query.edit_message_text("Dữ liệu nút không hợp lệ.")
+        return
+
+    action = parts[1]
+    req_id = parts[2]
+    pending = _pending_registrations(context)
+    req = pending.get(req_id)
+    if not req:
+        await query.edit_message_text("Yêu cầu không còn hiệu lực hoặc đã xử lý.")
+        return
+
+    status = (req.get("status") or "").strip().lower()
+    if status != "pending":
+        await query.edit_message_text(f"Yêu cầu đã được xử lý trước đó ({status}).")
+        return
+
+    # Giữ chỗ xử lý để tránh hai admin bấm đồng thời (một luồng asyncio tại một thời điểm sau await)
+    req["status"] = "processing"
+
+    chat_id = int(req["chat_id"])
+    username = (req.get("Username") or "").strip()
+    email_congty = (req.get("email_congty") or "").strip()
+    admin_name = (update.effective_user.full_name or "").strip() or str(admin_uid)
+
+    if action == "reject":
+        req["status"] = "rejected"
+        body = (
+            f"Đã TỪ CHỐI đăng ký #{req_id} bởi {admin_name}.\n"
+            f"Username: {username}\nEmail công ty: {email_congty}\nChat ID: {chat_id}"
+        )
+        await query.edit_message_text(body)
+        for aid in get_admin_telegram_chat_ids(sb):
+            if aid == update.effective_chat.id:
+                continue
+            try:
+                await context.bot.send_message(chat_id=aid, text=body)
+            except Exception as e:
+                logger.warning("notify reject admin %s: %s", aid, e)
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Đăng ký của bạn đã bị từ chối bởi quản trị viên. Bạn không được thêm vào hệ thống.",
+            )
+        except Exception as e:
+            logger.warning("notify reject applicant: %s", e)
+        return
+
+    if user_row_exists_for_telegram(sb, chat_id):
+        req["status"] = "approved"
+        msg_dup = (
+            f"Đã duyệt #{req_id} nhưng user với telegram_ID={chat_id} đã tồn tại (trùng)."
+        )
+        await query.edit_message_text(msg_dup)
+        return
+
+    payload = {
+        "Username": username,
+        "useremail": DEFAULT_REGISTRATION_USEREMAIL,
+        "telegram_ID": str(chat_id),
+        "gcal_refresh_token": DEFAULT_REGISTRATION_GCAL_REFRESH,
+        "email_congty": email_congty,
+        "Role": "Member",
+    }
+    try:
+        sb.table(SUPABASE_USER_TABLE).insert(payload).execute()
+    except Exception as e:
+        logger.exception("insert user registration: %s", e)
+        req["status"] = "pending"
+        await query.edit_message_text(f"Lỗi khi thêm user: {e}")
+        return
+
+    req["status"] = "approved"
+    ok_body = (
+        f"Đã DUYỆT đăng ký #{req_id} bởi {admin_name}.\n"
+        f"User đã được thêm vào bảng user (Role = Member).\n"
+        f"Username: {username}\nEmail công ty: {email_congty}\nChat ID: {chat_id}"
+    )
+    await query.edit_message_text(ok_body)
+
+    for aid in get_admin_telegram_chat_ids(sb):
+        if aid == update.effective_chat.id:
+            continue
+        try:
+            await context.bot.send_message(chat_id=aid, text=ok_body)
+        except Exception as e:
+            logger.warning("notify approve admin %s: %s", aid, e)
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Đăng ký của bạn đã được duyệt. Tài khoản đã được thêm vào hệ thống "
+                "(Role: Member). Bạn có thể dùng các tính năng bot theo cấu hình."
+            ),
+        )
+    except Exception as e:
+        logger.warning("notify approve applicant: %s", e)
+
+
 # ======================= TELEGRAM HANDLERS =======================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -930,7 +1822,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"(Bot sẽ gửi lịch Google Calendar mỗi ngày khoảng {DAILY_CALENDAR_HOUR:02d}:{DAILY_CALENDAR_MINUTE:02d} giờ {GCALENDAR_TZ} nếu bạn có trong Supabase.)"
         )
         lines.append("/lich <nay|mai> - Xem lịch Google Calendar đã qua AI duyệt.")
+        lines.append(
+            "Chi tiết cuộc họp: hỏi thành viên / tài liệu / link (kèm ngày nếu cần) — bot lấy từ Google Calendar."
+        )
     if get_supabase_client():
+        lines.append("/dk - Đăng ký tự động (username + email công ty), chờ admin duyệt.")
         lines.append("/query <câu hỏi> - Truy vấn CSDL bằng ngôn ngữ tự nhiên.")
         lines.append("/tables - Xem cấu trúc CSDL (bảng, cột).")
         lines.append("/refresh - Cập nhật lại cache schema.")
@@ -1265,6 +2161,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not user_text or not user_text.strip():
         return
 
+    if is_meeting_detail_intent(user_text):
+        handled = await answer_meeting_detail_question(update, user_text.strip())
+        if handled:
+            return
+
     if is_calendar_intent(user_text):
         target_day, _ = resolve_day_keyword(user_text)
         if target_day is not None:
@@ -1325,9 +2226,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def gcalendar_ready() -> bool:
-    """Cần file JSON service account (Workspace), hoặc OAuth client + refresh token từng user trong DB."""
+    """Service Account, OAuth per-user, hoặc chế độ master (GCAL_MASTER_REFRESH_TOKEN + OAuth client)."""
     if not fetch_calendar_events_for_day or not format_day_schedule:
         return False
+    if use_gcal_master_aggregator():
+        return True
     sa = bool(GOOGLE_SERVICE_ACCOUNT_JSON)
     oauth = bool(GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET)
     return sa or oauth
@@ -1344,7 +2247,7 @@ def parse_telegram_chat_id(raw: Any) -> Optional[int]:
 
 
 async def daily_calendar_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue: gửi lịch Google Calendar trong ngày cho từng user có telegram_ID + useremail."""
+    """JobQueue: gửi lịch trong ngày — master: một lần gọi API rồi lọc theo email_congty từng user."""
     if not gcalendar_ready():
         logger.warning(
             "Nhắc lịch: thiếu google_calendar hoặc cấu hình Google (GOOGLE_SERVICE_ACCOUNT_JSON hoặc OAuth client)."
@@ -1366,40 +2269,52 @@ async def daily_calendar_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     today_local = datetime.now(tz).date()
     bot = context.application.bot
 
+    master_raw: Optional[List[Dict[str, Any]]] = None
+    master_err: Optional[str] = None
+    if use_gcal_master_aggregator():
+        try:
+            master_raw, master_err = await run_blocking(_fetch_master_calendar_raw, today_local, GCALENDAR_TZ)
+        except Exception as e:
+            logger.exception("Nhắc lịch master fetch: %s", e)
+            master_err = str(e)
+
     for row in rows:
-        email = (row.get("useremail") or "").strip()
+        cal_email = (row.get("email_congty") or "").strip()
         chat_id = parse_telegram_chat_id(row.get("telegram_ID"))
         refresh = (row.get("gcal_refresh_token") or "").strip() or None
         if not chat_id:
             continue
-        if refresh:
-            pass
-        elif GOOGLE_SERVICE_ACCOUNT_JSON and email:
-            pass
-        else:
+        if not cal_email:
             continue
 
-        try:
-            events, err = await run_blocking(
-                fetch_calendar_events_for_day,
-                email,
-                today_local,
-                GCALENDAR_TZ,
-                refresh,
-            )
-        except Exception as e:
-            logger.exception("Nhắc lịch fetch_calendar %s: %s", chat_id, e)
-            err = str(e)
-            events = None
+        if use_gcal_master_aggregator():
+            err = master_err
+            events = None if err else filter_calendar_events_for_user_email(master_raw or [], cal_email)
+        else:
+            if not refresh and not (GOOGLE_SERVICE_ACCOUNT_JSON and cal_email):
+                continue
+            try:
+                events, err = await run_blocking(
+                    fetch_calendar_events_for_day,
+                    cal_email,
+                    today_local,
+                    GCALENDAR_TZ,
+                    refresh,
+                )
+            except Exception as e:
+                logger.exception("Nhắc lịch fetch_calendar %s: %s", chat_id, e)
+                err = str(e)
+                events = None
         if err:
-            who = email or (f"gcal_refresh…{refresh[:6]}" if refresh else "?")
+            who = cal_email or (f"gcal_refresh…{refresh[:6]}" if refresh else "?")
             logger.warning("Lịch %s: %s", who, err)
             try:
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
                         "Không lấy được lịch Google Calendar hôm nay. "
-                        "Kiểm tra: Workspace + service account ủy quyền domain, hoặc cột gcal_refresh_token + OAuth."
+                        "Kiểm tra: GCAL_MASTER_REFRESH_TOKEN + OAuth client; hoặc Service Account; "
+                        "hoặc gcal_refresh_token trên Supabase (chế độ không dùng master)."
                     ),
                 )
             except Exception as se:
@@ -1460,6 +2375,18 @@ def main() -> None:
         .build()
     )
     app.add_handler(TypeHandler(Update, capture_incoming_update), group=-1)
+    dk_conv = ConversationHandler(
+        entry_points=[CommandHandler("dk", cmd_dk)],
+        states={
+            REG_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_username)],
+            REG_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_email)],
+        },
+        fallbacks=[CommandHandler("cancel", reg_cancel)],
+        name="registration_dk",
+        per_message=False,
+    )
+    app.add_handler(dk_conv)
+    app.add_handler(CallbackQueryHandler(registration_callback, pattern=r"^reg:(approve|reject):"))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("id", cmd_id))
