@@ -191,7 +191,36 @@ def save_chat_log(
     try:
         sb.table(SUPABASE_CHAT_LOG_TABLE).insert(payload).execute()
     except Exception as e:
-        logger.warning("Không lưu được chat log: %s", e)
+        logger.warning(
+            "Không lưu được chat log (%s): %s",
+            SUPABASE_CHAT_LOG_TABLE,
+            e,
+        )
+
+
+async def save_chat_log_async(
+    *,
+    direction: str,
+    chat_id: Optional[int],
+    message_text: str,
+    message_type: str = "text",
+    telegram_user_id: Optional[int] = None,
+    telegram_username: Optional[str] = None,
+    telegram_full_name: Optional[str] = None,
+    update_id: Optional[int] = None,
+) -> None:
+    """Ghi log chat vào Supabase nhưng không block event loop."""
+    await run_blocking(
+        save_chat_log,
+        direction=direction,
+        chat_id=chat_id,
+        message_text=message_text,
+        message_type=message_type,
+        telegram_user_id=telegram_user_id,
+        telegram_username=telegram_username,
+        telegram_full_name=telegram_full_name,
+        update_id=update_id,
+    )
 
 
 def _extract_message_payload(update: Update) -> Tuple[str, str]:
@@ -229,7 +258,7 @@ async def capture_incoming_update(update: Update, context: ContextTypes.DEFAULT_
     if chat_id is None:
         return
     text, message_type = _extract_message_payload(update)
-    save_chat_log(
+    await save_chat_log_async(
         direction="incoming",
         chat_id=chat_id,
         message_text=text,
@@ -249,16 +278,22 @@ async def patched_send_message(self: Bot, *args, **kwargs):
     text = kwargs.get("text")
     if text is None and len(args) > 1:
         text = args[1]
-    save_chat_log(
-        direction="outgoing",
-        chat_id=int(chat_id) if chat_id is not None else None,
-        message_text=str(text or ""),
-        message_type="text",
-        telegram_user_id=None,
-        telegram_username="bot",
-        telegram_full_name="bot",
-        update_id=None,
-    )
+    # Không chặn gửi tin nhắn (ghi log chạy nền)
+    try:
+        asyncio.create_task(
+            save_chat_log_async(
+                direction="outgoing",
+                chat_id=int(chat_id) if chat_id is not None else None,
+                message_text=str(text or ""),
+                message_type="text",
+                telegram_user_id=None,
+                telegram_username="bot",
+                telegram_full_name="bot",
+                update_id=None,
+            )
+        )
+    except Exception as e:
+        logger.debug("Không tạo được task ghi chat log outgoing: %s", e)
     return sent
 
 
@@ -327,6 +362,18 @@ def use_gcal_master_aggregator() -> bool:
         (GCAL_MASTER_REFRESH_TOKEN or "").strip()
         and GOOGLE_OAUTH_CLIENT_ID
         and GOOGLE_OAUTH_CLIENT_SECRET
+    )
+
+
+def calendar_oauth_revoked_hint(err: Any) -> str:
+    """Gợi ý khi Google trả invalid_grant (refresh token hết hạn / bị thu hồi)."""
+    s = str(err).lower()
+    if "invalid_grant" not in s and not ("revoked" in s and "token" in s):
+        return ""
+    return (
+        "\n\nRefresh token Google đã hết hạn hoặc bị thu hồi. "
+        "Chạy: python get_gcal_refresh_token.py (đăng nhập đúng tài khoản lịch master, ví dụ "
+        f"{GCAL_MASTER_EMAIL}). Cập nhật GCAL_MASTER_REFRESH_TOKEN trong .env hoặc cột gcal_refresh_token trên Supabase."
     )
 
 
@@ -916,10 +963,10 @@ async def answer_meeting_detail_question(update: Update, user_text: str) -> bool
         )
     except Exception as e:
         logger.exception("answer_meeting_detail_question fetch: %s", e)
-        await update.message.reply_text(f"Lấy lịch lỗi: {e}")
+        await update.message.reply_text(f"Lấy lịch lỗi: {e}{calendar_oauth_revoked_hint(e)}")
         return True
     if err:
-        await update.message.reply_text(f"Lấy lịch lỗi: {err}")
+        await update.message.reply_text(f"Lấy lịch lỗi: {err}{calendar_oauth_revoked_hint(err)}")
         return True
 
     ev_list = events or []
@@ -1465,10 +1512,10 @@ async def answer_calendar_question(
         )
     except Exception as e:
         logger.exception("answer_calendar_question fetch_calendar: %s", e)
-        await update.message.reply_text(f"Lấy lịch lỗi: {e}")
+        await update.message.reply_text(f"Lấy lịch lỗi: {e}{calendar_oauth_revoked_hint(e)}")
         return True
     if err:
-        await update.message.reply_text(f"Lấy lịch lỗi: {err}")
+        await update.message.reply_text(f"Lấy lịch lỗi: {err}{calendar_oauth_revoked_hint(err)}")
         return True
 
     assert format_day_schedule is not None
@@ -2315,6 +2362,7 @@ async def daily_calendar_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
                         "Không lấy được lịch Google Calendar hôm nay. "
                         "Kiểm tra: GCAL_MASTER_REFRESH_TOKEN + OAuth client; hoặc Service Account; "
                         "hoặc gcal_refresh_token trên Supabase (chế độ không dùng master)."
+                        + calendar_oauth_revoked_hint(err)
                     ),
                 )
             except Exception as se:

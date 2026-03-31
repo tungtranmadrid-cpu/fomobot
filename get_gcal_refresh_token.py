@@ -11,7 +11,9 @@ Trước đó:
 
 Chạy:  python get_gcal_refresh_token.py
 
-Dán refresh token in ra vào Supabase bảng user, cột gcal_refresh_token (dòng đúng telegram_ID).
+Dán refresh token in ra vào:
+  - .env → GCAL_MASTER_REFRESH_TOKEN (chế độ lịch tập trung / master), hoặc
+  - Supabase bảng user, cột gcal_refresh_token (dòng đúng telegram_ID, chế độ OAuth từng user).
 
 Tuỳ chọn: GOOGLE_OAUTH_CLIENT_KIND=installed — dùng luồng "Desktop" cũ (redirect động, port ngẫu nhiên).
 """
@@ -96,7 +98,7 @@ def main() -> None:
     if not rt:
         print("Không nhận được refresh_token. Thử lại hoặc kiểm tra OAuth consent / redirect URI khớp Console.", file=sys.stderr)
         sys.exit(1)
-    print("\nRefresh token (dán vào Supabase → user → gcal_refresh_token):\n")
+    print("\nRefresh token (dán vào .env GCAL_MASTER_REFRESH_TOKEN hoặc Supabase → user → gcal_refresh_token):\n")
     print(rt)
 
 
