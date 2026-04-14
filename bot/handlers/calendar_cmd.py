@@ -36,7 +36,22 @@ from ..config import GCALENDAR_TZ
 logger = logging.getLogger(__name__)
 
 # Callback prefix cho inline keyboard chọn cuộc họp khi ambiguous.
+# callback_data tối đa 64 byte → không nhét event_id dài vào được (recurring
+# event id dạng 'xxx_20260414T030000Z' có thể > 64B). Lưu event_ids ở
+# _pending_picks theo chat_id, callback chỉ mang index ngắn.
 MEET_PICK_PREFIX = "meetpick:"
+_pending_picks: Dict[int, List[str]] = {}
+
+
+def _register_pending_picks(chat_id: int, event_ids: List[str]) -> None:
+    _pending_picks[chat_id] = event_ids
+
+
+def _get_pending_pick(chat_id: int, idx: int) -> Optional[str]:
+    ids = _pending_picks.get(chat_id) or []
+    if 0 <= idx < len(ids):
+        return ids[idx]
+    return None
 
 
 def _short_label_for_event(ev: Dict[str, Any], idx: int, display_tz: str) -> str:
@@ -64,15 +79,22 @@ def _short_label_for_event(ev: Dict[str, Any], idx: int, display_tz: str) -> str
     return f"{head} {title}"
 
 
-def _build_pick_keyboard(events: List[Dict[str, Any]], display_tz: str) -> InlineKeyboardMarkup:
+def _build_pick_keyboard(
+    chat_id: int,
+    events: List[Dict[str, Any]],
+    display_tz: str,
+) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
+    event_ids: List[str] = []
     for i, ev in enumerate(events):
         eid = (ev.get("id") or "").strip()
         if not eid:
             continue
-        label = _short_label_for_event(ev, i, display_tz)
-        # callback_data tối đa 64 byte; event_id Google ~26-32 chars → an toàn.
-        rows.append([InlineKeyboardButton(label, callback_data=f"{MEET_PICK_PREFIX}{eid}")])
+        event_ids.append(eid)
+        idx = len(event_ids) - 1
+        label = _short_label_for_event(ev, idx, display_tz)
+        rows.append([InlineKeyboardButton(label, callback_data=f"{MEET_PICK_PREFIX}{idx}")])
+    _register_pending_picks(chat_id, event_ids)
     return InlineKeyboardMarkup(rows)
 
 
@@ -220,7 +242,7 @@ async def answer_meeting_detail_question(update: Update, user_text: str) -> bool
 
     # Ambiguous / không rõ → hiển thị inline keyboard cho user bấm chọn.
     if reason in ("ambiguous", "error") or idx < 0:
-        keyboard = _build_pick_keyboard(ev_list, GCALENDAR_TZ)
+        keyboard = _build_pick_keyboard(chat_id, ev_list, GCALENDAR_TZ)
         prompt = (
             f"Ngày {target_day.strftime('%d/%m/%Y')} có {len(ev_list)} cuộc họp. "
             "Bạn muốn xem chi tiết cuộc nào?"
@@ -245,16 +267,25 @@ async def on_meeting_pick_callback(update: Update, context: ContextTypes.DEFAULT
     data = (query.data or "").strip()
     if not data.startswith(MEET_PICK_PREFIX):
         return
-    event_id = data[len(MEET_PICK_PREFIX):].strip()
+    idx_raw = data[len(MEET_PICK_PREFIX):].strip()
+    try:
+        idx = int(idx_raw)
+    except ValueError:
+        await query.edit_message_text("Callback không hợp lệ.")
+        return
+
+    chat_id = update.effective_chat.id
+    event_id = _get_pending_pick(chat_id, idx)
     if not event_id:
-        await query.edit_message_text("Mã sự kiện trống.")
+        await query.edit_message_text(
+            "Danh sách cuộc họp đã hết hạn. Hỏi lại giúp mình nhé."
+        )
         return
 
     sb = get_supabase_client()
     if not sb:
         await query.edit_message_text("Chưa cấu hình Supabase.")
         return
-    chat_id = update.effective_chat.id
     email, refresh, name, profile_err = get_user_calendar_profile(sb, chat_id)
     if profile_err:
         await query.edit_message_text(profile_err)
