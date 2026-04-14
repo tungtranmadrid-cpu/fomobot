@@ -17,7 +17,7 @@ from .calendar.reminder import post_init_schedule
 from .chat_log import LoggingBot
 from .config import OPENAI_API_KEY, TELEGRAM_BOT_TOKEN
 from .handlers.basic import cmd_clear, cmd_id, cmd_model, cmd_start, cmd_think
-from .handlers.calendar_cmd import cmd_lich
+from .handlers.calendar_cmd import MEET_PICK_PREFIX, cmd_lich, on_meeting_pick_callback
 from .handlers.capture import capture_incoming_update
 from .handlers.chat import handle_message
 from .handlers.db_cmd import cmd_query, cmd_refresh, cmd_tables
@@ -63,6 +63,7 @@ def main() -> None:
     )
     app.add_handler(dk_conv)
     app.add_handler(CallbackQueryHandler(registration_callback, pattern=r"^reg:(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(on_meeting_pick_callback, pattern=rf"^{MEET_PICK_PREFIX}"))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("id", cmd_id))
