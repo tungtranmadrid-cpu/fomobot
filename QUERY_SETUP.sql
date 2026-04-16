@@ -49,32 +49,83 @@ AS $$
   ORDER BY c.table_name, c.ordinal_position;
 $$;
 
+REVOKE ALL ON FUNCTION get_schema_info() FROM PUBLIC;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION get_schema_info() TO service_role';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION get_schema_info() TO authenticated';
+  END IF;
+END $$;
+
 -- ============================================================
--- 2. Hàm chạy SQL read-only: chỉ cho phép SELECT/WITH, chặn mọi thao tác ghi
+-- 2. Hàm chạy SQL read-only
+--    Lớp phòng thủ:
+--    (a) Chỉ chấp nhận câu bắt đầu SELECT / WITH (sau khi strip comment).
+--    (b) Chặn keyword ghi/DDL (belt & suspenders).
+--    (c) SET LOCAL transaction_read_only = on  -> Postgres tự từ chối mọi
+--        thao tác ghi (kể cả ẩn trong CTE, function SECURITY DEFINER khác,
+--        subquery, v.v.).
+--    (d) SET LOCAL statement_timeout = 5s       -> tránh query treo DB.
+--    (e) Hàm chạy với SECURITY INVOKER — quyền của caller (bot dùng role
+--        riêng `bot_readonly`, xem mục 2b). Không còn escalate privilege.
 -- ============================================================
+
+-- 2a. Role chỉ đọc dành riêng cho bot
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bot_readonly') THEN
+    CREATE ROLE bot_readonly NOLOGIN;
+  END IF;
+END $$;
+
+GRANT USAGE ON SCHEMA public TO bot_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO bot_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT ON TABLES TO bot_readonly;
+
+-- Cho service_role (Supabase) "mượn" quyền của bot_readonly khi cần:
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    EXECUTE 'GRANT bot_readonly TO service_role';
+  END IF;
+END $$;
+
+-- 2b. Hàm
 CREATE OR REPLACE FUNCTION execute_readonly_sql(query text)
 RETURNS json
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = public
 AS $$
 DECLARE
   result json;
+  stripped text;
   normalized text;
 BEGIN
-  normalized := lower(btrim(query));
+  -- Strip block comment /* ... */ và line comment -- ...
+  stripped := regexp_replace(query, '/\*.*?\*/', '', 'gs');
+  stripped := regexp_replace(stripped, '--[^\n]*', '', 'g');
+  normalized := lower(btrim(stripped));
 
-  -- Phải bắt đầu bằng SELECT hoặc WITH (CTE)
-  IF NOT (normalized LIKE 'select %' OR normalized LIKE 'with %') THEN
-    RAISE EXCEPTION 'Chỉ cho phép câu lệnh SELECT.';
+  IF NOT (normalized LIKE 'select %'
+          OR normalized LIKE 'select('
+          OR normalized LIKE 'with %') THEN
+    RAISE EXCEPTION 'Chỉ cho phép câu lệnh SELECT / WITH.';
   END IF;
 
-  -- Chặn các từ khoá ghi/xoá/DDL (word boundary \y)
-  IF normalized ~ '\y(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy)\y' THEN
+  IF normalized ~ '\y(insert|update|delete|drop|alter|create|truncate|grant|revoke|copy|call|do|reindex|vacuum|analyze|refresh|listen|notify|lock|begin|commit|rollback|savepoint|set)\y' THEN
     RAISE EXCEPTION 'Câu lệnh chứa từ khoá bị cấm.';
   END IF;
 
-  -- Chạy và trả về JSON array
+  -- Lớp bảo vệ cuối: Postgres từ chối mọi write trong transaction này.
+  SET LOCAL transaction_read_only = on;
+  SET LOCAL statement_timeout = '5s';
+  SET LOCAL lock_timeout = '2s';
+
   EXECUTE format(
     'SELECT coalesce(json_agg(row_to_json(t)), ''[]''::json) FROM (%s) t',
     query
@@ -83,6 +134,17 @@ BEGIN
   RETURN result;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION execute_readonly_sql(text) FROM PUBLIC;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION execute_readonly_sql(text) TO service_role';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION execute_readonly_sql(text) TO authenticated';
+  END IF;
+END $$;
 
 -- ============================================================
 -- 3. Bảng RAG: lưu chunk text + embedding (vector) để tìm kiếm ngữ nghĩa
@@ -147,6 +209,17 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION search_rag_by_embedding(text, int) FROM PUBLIC;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION search_rag_by_embedding(text, int) TO service_role';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION search_rag_by_embedding(text, int) TO authenticated';
+  END IF;
+END $$;
+
 -- Xóa toàn bộ chunk (gọi trước khi re-index)
 CREATE OR REPLACE FUNCTION truncate_rag_chunks()
 RETURNS void
@@ -156,6 +229,14 @@ SET search_path = public
 AS $$
   TRUNCATE TABLE rag_chunks;
 $$;
+
+REVOKE ALL ON FUNCTION truncate_rag_chunks() FROM PUBLIC;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION truncate_rag_chunks() TO service_role';
+  END IF;
+END $$;
 
 -- ============================================================
 -- 5. Hàm tìm chunk theo từ khóa (fallback khi chưa có embedding)
@@ -183,6 +264,17 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION search_rag_chunks(text[], int) FROM PUBLIC;
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION search_rag_chunks(text[], int) TO service_role';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    EXECUTE 'GRANT EXECUTE ON FUNCTION search_rag_chunks(text[], int) TO authenticated';
+  END IF;
+END $$;
+
 -- ============================================================
 -- 6. Bảng log chat Telegram: lưu toàn bộ tin nhắn vào/ra bot
 -- ============================================================
@@ -204,3 +296,58 @@ CREATE INDEX IF NOT EXISTS telegram_chat_logs_chat_id_idx
 
 CREATE INDEX IF NOT EXISTS telegram_chat_logs_created_at_idx
   ON telegram_chat_logs (created_at DESC);
+
+-- ============================================================
+-- 7.5. Bảng meeting_tasks: công việc trích từ biên bản cuộc họp.
+--      Bot (LLM) đọc description của event Google Calendar → ra
+--      danh sách task (tên, chi tiết, người thực hiện, deadline).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS meeting_tasks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  meeting_event_id TEXT NOT NULL,
+  meeting_summary TEXT,
+  meeting_start TIMESTAMPTZ,
+  task_name TEXT NOT NULL,
+  task_detail TEXT,
+  assignee_name TEXT,
+  assignee_email TEXT,
+  assignee_chat_id BIGINT,
+  deadline DATE,
+  deadline_raw TEXT,
+  created_by_chat_id BIGINT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS meeting_tasks_event_idx
+  ON meeting_tasks (meeting_event_id);
+CREATE INDEX IF NOT EXISTS meeting_tasks_deadline_idx
+  ON meeting_tasks (deadline);
+CREATE INDEX IF NOT EXISTS meeting_tasks_assignee_chat_idx
+  ON meeting_tasks (assignee_chat_id);
+
+-- ============================================================
+-- 8. Bảng bot_state: persistent state per chat_id (conversation,
+--    query_history, thinking). Bot tự upsert khi state thay đổi.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS bot_state (
+  chat_id BIGINT PRIMARY KEY,
+  conversation JSONB NOT NULL DEFAULT '[]'::jsonb,
+  query_history JSONB NOT NULL DEFAULT '[]'::jsonb,
+  thinking BOOLEAN NOT NULL DEFAULT false,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION bot_state_touch_updated_at()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS bot_state_touch ON bot_state;
+CREATE TRIGGER bot_state_touch
+  BEFORE UPDATE ON bot_state
+  FOR EACH ROW EXECUTE FUNCTION bot_state_touch_updated_at();

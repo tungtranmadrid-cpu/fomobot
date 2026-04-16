@@ -30,6 +30,12 @@ from ..calendar.intent import (
     select_event_index_by_ai,
 )
 from ..calendar.profile import get_user_calendar_profile
+from ..calendar.tasks import (
+    extract_tasks_from_event,
+    format_tasks_table,
+    resolve_assignees,
+    save_meeting_tasks,
+)
 from ..clients import get_supabase_client
 from ..config import GCALENDAR_TZ
 
@@ -40,7 +46,11 @@ logger = logging.getLogger(__name__)
 # event id dạng 'xxx_20260414T030000Z' có thể > 64B). Lưu event_ids ở
 # _pending_picks theo chat_id, callback chỉ mang index ngắn.
 MEET_PICK_PREFIX = "meetpick:"
+MEET_SUM_PREFIX = "meetsum:"
 _pending_picks: Dict[int, List[str]] = {}
+# chat_id → list[event_id] dùng cho nút "Tóm tắt → công việc". Callback chỉ
+# mang index ngắn, event_id lookup ở đây (tránh vượt 64 byte callback_data).
+_pending_summarize: Dict[int, List[str]] = {}
 
 
 def _register_pending_picks(chat_id: int, event_ids: List[str]) -> None:
@@ -49,6 +59,24 @@ def _register_pending_picks(chat_id: int, event_ids: List[str]) -> None:
 
 def _get_pending_pick(chat_id: int, idx: int) -> Optional[str]:
     ids = _pending_picks.get(chat_id) or []
+    if 0 <= idx < len(ids):
+        return ids[idx]
+    return None
+
+
+def _register_summarize_event(chat_id: int, event_id: str) -> int:
+    """Lưu event_id để nút Tóm tắt lookup. Trả idx trong list."""
+    lst = _pending_summarize.setdefault(chat_id, [])
+    if event_id in lst:
+        return lst.index(event_id)
+    lst.append(event_id)
+    if len(lst) > 50:  # cap để không phình bộ nhớ
+        lst.pop(0)
+    return lst.index(event_id)
+
+
+def _get_summarize_event(chat_id: int, idx: int) -> Optional[str]:
+    ids = _pending_summarize.get(chat_id) or []
     if 0 <= idx < len(ids):
         return ids[idx]
     return None
@@ -124,11 +152,28 @@ async def _send_meeting_detail_for_event(
     body = format_meeting_details_text(full_ev, GCALENDAR_TZ, members_by_email)
     if name:
         body = f"Chào {name},\n\n{body}"
+
+    # Nút "Tóm tắt → danh sách công việc" chỉ hiện khi có nội dung description
+    # (nơi user viết biên bản). Nếu description trống thì không có gì để trích.
+    has_minutes = bool((full_ev.get("description") or "").strip())
+    reply_markup: Optional[InlineKeyboardMarkup] = None
+    if has_minutes:
+        idx = _register_summarize_event(chat.id, event_id)
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(
+                "Tóm tắt → danh sách công việc",
+                callback_data=f"{MEET_SUM_PREFIX}{idx}",
+            )]]
+        )
+
     if len(body) > 4000:
-        for i in range(0, len(body), 4000):
-            await chat.send_message(body[i : i + 4000])
+        # Chia nhỏ: các phần trước gửi trơn, phần cuối mang keyboard.
+        chunks = [body[i : i + 4000] for i in range(0, len(body), 4000)]
+        for c in chunks[:-1]:
+            await chat.send_message(c)
+        await chat.send_message(chunks[-1], reply_markup=reply_markup)
     else:
-        await chat.send_message(body)
+        await chat.send_message(body, reply_markup=reply_markup)
 
 
 async def answer_calendar_question(
@@ -298,6 +343,73 @@ async def on_meeting_pick_callback(update: Update, context: ContextTypes.DEFAULT
 
     await update.effective_chat.send_action("typing")
     await _send_meeting_detail_for_event(update.effective_chat, event_id, email or "", refresh, name, sb)
+
+
+async def on_meeting_summarize_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback khi user bấm 'Tóm tắt → danh sách công việc' dưới chi tiết cuộc họp."""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    data = (query.data or "").strip()
+    if not data.startswith(MEET_SUM_PREFIX):
+        return
+    try:
+        idx = int(data[len(MEET_SUM_PREFIX):].strip())
+    except ValueError:
+        return
+
+    chat_id = update.effective_chat.id
+    event_id = _get_summarize_event(chat_id, idx)
+    if not event_id:
+        await update.effective_chat.send_message(
+            "Nút đã hết hạn (bot restart hoặc bộ nhớ đã xoay). "
+            "Hỏi lại chi tiết cuộc họp rồi bấm nút tóm tắt giúp mình nhé."
+        )
+        return
+
+    sb = get_supabase_client()
+    if not sb:
+        await update.effective_chat.send_message("Chưa cấu hình Supabase.")
+        return
+    email, refresh, _name, profile_err = get_user_calendar_profile(sb, chat_id)
+    if profile_err:
+        await update.effective_chat.send_message(profile_err)
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await update.effective_chat.send_action("typing")
+    full_ev, gerr = await run_blocking(
+        fetch_calendar_event_by_id, email or "", refresh, event_id
+    )
+    if gerr or not full_ev:
+        await update.effective_chat.send_message(
+            f"Không đọc được chi tiết sự kiện: {gerr or 'unknown'}"
+        )
+        return
+
+    tasks = await run_blocking(extract_tasks_from_event, full_ev, GCALENDAR_TZ)
+    if not tasks:
+        await update.effective_chat.send_message(
+            format_tasks_table(full_ev, [], GCALENDAR_TZ)
+        )
+        return
+
+    tasks = await run_blocking(resolve_assignees, sb, tasks)
+    saved = await run_blocking(save_meeting_tasks, sb, full_ev, tasks, chat_id, GCALENDAR_TZ)
+
+    body = format_tasks_table(full_ev, tasks, GCALENDAR_TZ)
+    footer = f"\n\nĐã lưu {saved} công việc vào meeting_tasks." if saved else ""
+    full_text = body + footer
+    if len(full_text) > 4000:
+        for i in range(0, len(full_text), 4000):
+            await update.effective_chat.send_message(full_text[i : i + 4000])
+    else:
+        await update.effective_chat.send_message(full_text)
 
 
 async def cmd_lich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -1,4 +1,5 @@
 """Định dạng lịch & chi tiết cuộc họp thành text Telegram."""
+import html
 import logging
 import re
 from datetime import date, datetime
@@ -14,6 +15,38 @@ from ..config import MEETING_HIDE_EMAILS_RAW, SUPABASE_MEMBERS_TABLE
 logger = logging.getLogger(__name__)
 
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\[\]\"']+")
+
+# Google Calendar lưu description dạng HTML nhẹ (<br>, <div>, <a>, <ul><li>, <b>, <i>...).
+# Convert về text thuần để hiển thị trên Telegram.
+_BR_RE = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
+_BLOCK_OPEN_RE = re.compile(r"<\s*(div|p|ul|ol|tr)\b[^>]*>", re.IGNORECASE)
+_BLOCK_CLOSE_RE = re.compile(r"<\s*/\s*(div|p|ul|ol|tr)\s*>", re.IGNORECASE)
+_LI_OPEN_RE = re.compile(r"<\s*li\b[^>]*>", re.IGNORECASE)
+_LI_CLOSE_RE = re.compile(r"<\s*/\s*li\s*>", re.IGNORECASE)
+_ANY_TAG_RE = re.compile(r"<[^>]+>")
+_MULTI_BLANKLINE_RE = re.compile(r"\n{3,}")
+
+
+def html_description_to_text(desc: str) -> str:
+    """Chuyển mô tả Google Calendar (HTML nhẹ) thành text đọc được trên Telegram."""
+    s = desc or ""
+    if not s:
+        return ""
+    s = _BR_RE.sub("\n", s)
+    s = _BLOCK_OPEN_RE.sub("\n", s)
+    s = _BLOCK_CLOSE_RE.sub("\n", s)
+    s = _LI_OPEN_RE.sub("\n  • ", s)
+    s = _LI_CLOSE_RE.sub("", s)
+    s = _ANY_TAG_RE.sub("", s)
+    s = html.unescape(s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = _MULTI_BLANKLINE_RE.sub("\n\n", s)
+    lines = [ln.rstrip() for ln in s.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
 
 
 def _meeting_hidden_emails_set() -> set:
@@ -281,5 +314,11 @@ def format_meeting_details_text(
             "Tài liệu cuộc họp: không thấy file đính kèm hay link tài liệu (ngoài link họp trực tuyến). "
             "Có thể bổ sung trên Google Calendar."
         )
+
+    desc_text = html_description_to_text(desc)
+    if desc_text:
+        lines.append("")
+        lines.append("Mô tả / biên bản cuộc họp (từ Google Calendar):")
+        lines.append(desc_text)
 
     return "\n".join(lines)
