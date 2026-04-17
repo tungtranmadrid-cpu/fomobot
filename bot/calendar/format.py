@@ -194,8 +194,10 @@ def format_meeting_details_text(
     ev: Dict[str, Any],
     display_tz: str,
     members_by_email: Optional[Dict[str, Dict[str, Any]]] = None,
+    show_description: bool = True,
 ) -> str:
-    """Trình bày chi tiết cuộc họp: giờ, thành phần (+ members), họp trực tuyến vs tài liệu."""
+    """Trình bày chi tiết cuộc họp: giờ, thành phần (+ members), họp trực tuyến vs tài liệu.
+    show_description=False: bỏ block "Mô tả / biên bản" (dùng khi sẽ thay bằng tóm tắt LLM)."""
     summary = (ev.get("summary") or "(Không tiêu đề)").strip()
     lines: List[str] = [f"Cuộc họp / sự kiện: {summary}"]
 
@@ -315,10 +317,11 @@ def format_meeting_details_text(
             "Có thể bổ sung trên Google Calendar."
         )
 
-    desc_text = html_description_to_text(desc)
-    if desc_text:
-        lines.append("")
-        lines.append("Mô tả / biên bản cuộc họp (từ Google Calendar):")
-        lines.append(desc_text)
+    if show_description:
+        desc_text = html_description_to_text(desc)
+        if desc_text:
+            lines.append("")
+            lines.append("Mô tả / biên bản cuộc họp (từ Google Calendar):")
+            lines.append(desc_text)
 
     return "\n".join(lines)

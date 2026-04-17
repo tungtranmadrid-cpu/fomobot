@@ -1,4 +1,5 @@
 """Handlers Google Calendar: /lich + trả lời câu hỏi lịch / chi tiết cuộc họp."""
+import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -23,18 +24,23 @@ from ..calendar.format import (
     format_day_schedule,
     format_meeting_details_text,
     is_hidden_meeting_report_email,
+    parse_google_start_end,
 )
 from ..calendar.intent import (
+    extract_time_of_day,
     resolve_day_for_meeting_query,
     resolve_day_keyword,
     select_event_index_by_ai,
 )
 from ..calendar.profile import get_user_calendar_profile
 from ..calendar.tasks import (
-    extract_tasks_from_event,
+    fetch_members_snapshot,
+    format_summary_section,
     format_tasks_table,
+    has_saved_tasks_for_event,
     resolve_assignees,
     save_meeting_tasks,
+    summarize_and_extract_tasks,
 )
 from ..clients import get_supabase_client
 from ..config import GCALENDAR_TZ
@@ -46,11 +52,7 @@ logger = logging.getLogger(__name__)
 # event id dạng 'xxx_20260414T030000Z' có thể > 64B). Lưu event_ids ở
 # _pending_picks theo chat_id, callback chỉ mang index ngắn.
 MEET_PICK_PREFIX = "meetpick:"
-MEET_SUM_PREFIX = "meetsum:"
 _pending_picks: Dict[int, List[str]] = {}
-# chat_id → list[event_id] dùng cho nút "Tóm tắt → công việc". Callback chỉ
-# mang index ngắn, event_id lookup ở đây (tránh vượt 64 byte callback_data).
-_pending_summarize: Dict[int, List[str]] = {}
 
 
 def _register_pending_picks(chat_id: int, event_ids: List[str]) -> None:
@@ -59,24 +61,6 @@ def _register_pending_picks(chat_id: int, event_ids: List[str]) -> None:
 
 def _get_pending_pick(chat_id: int, idx: int) -> Optional[str]:
     ids = _pending_picks.get(chat_id) or []
-    if 0 <= idx < len(ids):
-        return ids[idx]
-    return None
-
-
-def _register_summarize_event(chat_id: int, event_id: str) -> int:
-    """Lưu event_id để nút Tóm tắt lookup. Trả idx trong list."""
-    lst = _pending_summarize.setdefault(chat_id, [])
-    if event_id in lst:
-        return lst.index(event_id)
-    lst.append(event_id)
-    if len(lst) > 50:  # cap để không phình bộ nhớ
-        lst.pop(0)
-    return lst.index(event_id)
-
-
-def _get_summarize_event(chat_id: int, idx: int) -> Optional[str]:
-    ids = _pending_summarize.get(chat_id) or []
     if 0 <= idx < len(ids):
         return ids[idx]
     return None
@@ -126,6 +110,52 @@ def _build_pick_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+async def _send_long_text(chat: Any, text: str) -> None:
+    """Gửi tin nhắn; chia 4000 char nếu quá dài."""
+    if len(text) <= 4000:
+        await chat.send_message(text)
+        return
+    for i in range(0, len(text), 4000):
+        await chat.send_message(text[i : i + 4000])
+
+
+async def _run_summary_and_save_tasks(
+    full_ev: Dict[str, Any],
+    members: List[Dict[str, Any]],
+    sb: Any,
+    created_by_chat_id: int,
+) -> str:
+    """Auto: LLM tóm tắt + trích task → resolve assignees → save (dedup). Trả text gộp."""
+    summary_dict, tasks = await run_blocking(
+        summarize_and_extract_tasks, full_ev, members, GCALENDAR_TZ
+    )
+    parts: List[str] = []
+    summary_text = format_summary_section(summary_dict)
+    if summary_text:
+        parts.append(summary_text)
+
+    if tasks:
+        tasks = await run_blocking(resolve_assignees, sb, tasks, members)
+        event_id = (full_ev.get("id") or "").strip()
+        already = await run_blocking(has_saved_tasks_for_event, sb, event_id)
+        saved = 0
+        if not already:
+            saved = await run_blocking(
+                save_meeting_tasks, sb, full_ev, tasks, created_by_chat_id, GCALENDAR_TZ
+            )
+        body = format_tasks_table(full_ev, tasks, GCALENDAR_TZ)
+        if already:
+            body += "\n\n(Các công việc này đã được lưu trước đó — không insert lại.)"
+        elif saved:
+            body += f"\n\nĐã lưu {saved} công việc vào meeting_tasks."
+        parts.append(body)
+    elif summary_text:
+        # Có biên bản để tóm tắt nhưng không trích được task → báo nhẹ.
+        parts.append(format_tasks_table(full_ev, [], GCALENDAR_TZ))
+
+    return "\n\n".join(p for p in parts if p)
+
+
 async def _send_meeting_detail_for_event(
     chat: Any,
     event_id: str,
@@ -134,7 +164,7 @@ async def _send_meeting_detail_for_event(
     name: Optional[str],
     sb: Any,
 ) -> None:
-    """Fetch chi tiết 1 event + format + send. Dùng chung cho initial flow & callback pick."""
+    """Fetch chi tiết 1 event + format + send. Auto tóm tắt + trích task nếu có biên bản."""
     full_ev, gerr = await run_blocking(fetch_calendar_event_by_id, email or "", refresh, event_id)
     if gerr or not full_ev:
         await chat.send_message(f"Không đọc chi tiết sự kiện: {gerr or 'unknown'}")
@@ -149,31 +179,22 @@ async def _send_meeting_detail_for_event(
     if attendee_emails:
         members_by_email = await run_blocking(fetch_members_by_emails, sb, attendee_emails)
 
-    body = format_meeting_details_text(full_ev, GCALENDAR_TZ, members_by_email)
+    has_minutes = bool((full_ev.get("description") or "").strip())
+    # Có biên bản → bỏ phần raw description, thay bằng tóm tắt + task list.
+    body = format_meeting_details_text(
+        full_ev, GCALENDAR_TZ, members_by_email, show_description=not has_minutes
+    )
     if name:
         body = f"Chào {name},\n\n{body}"
 
-    # Nút "Tóm tắt → danh sách công việc" chỉ hiện khi có nội dung description
-    # (nơi user viết biên bản). Nếu description trống thì không có gì để trích.
-    has_minutes = bool((full_ev.get("description") or "").strip())
-    reply_markup: Optional[InlineKeyboardMarkup] = None
     if has_minutes:
-        idx = _register_summarize_event(chat.id, event_id)
-        reply_markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(
-                "Tóm tắt → danh sách công việc",
-                callback_data=f"{MEET_SUM_PREFIX}{idx}",
-            )]]
-        )
+        await chat.send_action("typing")
+        members = await run_blocking(fetch_members_snapshot, sb)
+        extra = await _run_summary_and_save_tasks(full_ev, members, sb, chat.id)
+        if extra:
+            body = body + "\n\n" + extra
 
-    if len(body) > 4000:
-        # Chia nhỏ: các phần trước gửi trơn, phần cuối mang keyboard.
-        chunks = [body[i : i + 4000] for i in range(0, len(body), 4000)]
-        for c in chunks[:-1]:
-            await chat.send_message(c)
-        await chat.send_message(chunks[-1], reply_markup=reply_markup)
-    else:
-        await chat.send_message(body, reply_markup=reply_markup)
+    await _send_long_text(chat, body)
 
 
 async def answer_calendar_question(
@@ -345,74 +366,221 @@ async def on_meeting_pick_callback(update: Update, context: ContextTypes.DEFAULT
     await _send_meeting_detail_for_event(update.effective_chat, event_id, email or "", refresh, name, sb)
 
 
-async def on_meeting_summarize_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback khi user bấm 'Tóm tắt → danh sách công việc' dưới chi tiết cuộc họp."""
-    query = update.callback_query
-    if not query:
-        return
-    await query.answer()
-    data = (query.data or "").strip()
-    if not data.startswith(MEET_SUM_PREFIX):
-        return
-    try:
-        idx = int(data[len(MEET_SUM_PREFIX):].strip())
-    except ValueError:
-        return
-
-    chat_id = update.effective_chat.id
-    event_id = _get_summarize_event(chat_id, idx)
-    if not event_id:
-        await update.effective_chat.send_message(
-            "Nút đã hết hạn (bot restart hoặc bộ nhớ đã xoay). "
-            "Hỏi lại chi tiết cuộc họp rồi bấm nút tóm tắt giúp mình nhé."
-        )
-        return
-
-    sb = get_supabase_client()
-    if not sb:
-        await update.effective_chat.send_message("Chưa cấu hình Supabase.")
-        return
-    email, refresh, _name, profile_err = get_user_calendar_profile(sb, chat_id)
-    if profile_err:
-        await update.effective_chat.send_message(profile_err)
-        return
-
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    await update.effective_chat.send_action("typing")
-    full_ev, gerr = await run_blocking(
-        fetch_calendar_event_by_id, email or "", refresh, event_id
-    )
-    if gerr or not full_ev:
-        await update.effective_chat.send_message(
-            f"Không đọc được chi tiết sự kiện: {gerr or 'unknown'}"
-        )
-        return
-
-    tasks = await run_blocking(extract_tasks_from_event, full_ev, GCALENDAR_TZ)
-    if not tasks:
-        await update.effective_chat.send_message(
-            format_tasks_table(full_ev, [], GCALENDAR_TZ)
-        )
-        return
-
-    tasks = await run_blocking(resolve_assignees, sb, tasks)
-    saved = await run_blocking(save_meeting_tasks, sb, full_ev, tasks, chat_id, GCALENDAR_TZ)
-
-    body = format_tasks_table(full_ev, tasks, GCALENDAR_TZ)
-    footer = f"\n\nĐã lưu {saved} công việc vào meeting_tasks." if saved else ""
-    full_text = body + footer
-    if len(full_text) > 4000:
-        for i in range(0, len(full_text), 4000):
-            await update.effective_chat.send_message(full_text[i : i + 4000])
-    else:
-        await update.effective_chat.send_message(full_text)
-
-
 async def cmd_lich(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tra lịch theo cách nói tự nhiên: nay/mai/dd/mm/thứ N..."""
     day_raw = " ".join(context.args or []).strip() if context.args else "nay"
     await answer_calendar_question(update, day_raw)
+
+
+def _filter_events_by_time_of_day(
+    events: List[Dict[str, Any]],
+    tod: Optional[tuple],
+    display_tz: str,
+) -> List[Dict[str, Any]]:
+    """Lọc events theo khung giờ (sáng/chiều/tối). tod=None → trả nguyên."""
+    if not tod:
+        return events
+    h_start, h_end = tod
+    out: List[Dict[str, Any]] = []
+    for ev in events:
+        try:
+            _is_all, st, _en, _loc = parse_google_start_end(ev, display_tz)
+            if h_start <= st.hour < h_end:
+                out.append(ev)
+        except Exception:
+            continue
+    return out
+
+
+def _format_aggregated_tasks(all_tasks: List[Dict[str, Any]]) -> str:
+    """Gom task từ nhiều cuộc họp thành 1 bảng tổng."""
+    if not all_tasks:
+        return "(Không trích được công việc nào từ các cuộc họp trong khung thời gian này.)"
+    from datetime import date as _date
+
+    lines: List[str] = ["Danh sách công việc tổng hợp:", ""]
+    for i, t in enumerate(all_tasks, 1):
+        lines.append(f"{i}. Tên CV: {t.get('task_name') or '(không có)'}")
+        src = (t.get("_meeting_title") or "").strip()
+        if src:
+            lines.append(f"   Cuộc họp: {src}")
+        detail = (t.get("task_detail") or "").strip()
+        if detail:
+            lines.append(f"   Chi tiết: {detail}")
+        assignees = t.get("assignees") or []
+        if assignees:
+            parts: List[str] = []
+            for a in assignees:
+                nm = (a.get("name") or "").strip() or "(không tên)"
+                em = (a.get("email") or "").strip()
+                parts.append(f"{nm} ({em})" if em else f"{nm} (chưa khớp)")
+            lines.append("   Người thực hiện: " + ", ".join(parts))
+        else:
+            lines.append("   Người thực hiện: (chưa rõ)")
+        dl = t.get("deadline")
+        dl_raw = (t.get("deadline_raw") or "").strip()
+        if isinstance(dl, _date):
+            lines.append(f"   Deadline: {dl.strftime('%d/%m/%Y')}")
+        elif dl_raw:
+            lines.append(f"   Deadline: {dl_raw}")
+        else:
+            lines.append("   Deadline: (chưa rõ)")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+async def _summarize_one_event(
+    email: str,
+    refresh: Optional[str],
+    ev: Dict[str, Any],
+    members: List[Dict[str, Any]],
+    display_tz: str,
+) -> Dict[str, Any]:
+    """Fetch full event + LLM summarize+extract. Trả dict {event, summary_dict, tasks} hoặc {error}."""
+    eid = (ev.get("id") or "").strip()
+    if not eid:
+        return {"event": ev, "error": "sự kiện không có id"}
+    full_ev, gerr = await run_blocking(fetch_calendar_event_by_id, email or "", refresh, eid)
+    if gerr or not full_ev:
+        return {"event": ev, "error": gerr or "không đọc được chi tiết"}
+    desc = (full_ev.get("description") or "").strip()
+    if not desc:
+        return {"event": full_ev, "summary_dict": {}, "tasks": [], "no_minutes": True}
+    summary_dict, tasks = await run_blocking(
+        summarize_and_extract_tasks, full_ev, members, display_tz
+    )
+    return {"event": full_ev, "summary_dict": summary_dict, "tasks": tasks}
+
+
+async def cmd_tomtat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/tomtat [nay/mai/sáng nay/chiều mai/...]: tóm tắt mọi cuộc họp + tổng hợp task."""
+    if not update.message:
+        return
+    if not gcalendar_ready():
+        await update.message.reply_text("Google Calendar chưa sẵn sàng. Kiểm tra GOOGLE_* trong .env.")
+        return
+    sb = get_supabase_client()
+    if not sb:
+        await update.message.reply_text("Chưa cấu hình Supabase.")
+        return
+
+    arg_raw = " ".join(context.args or []).strip() if context.args else "nay"
+    target_day, day_err = resolve_day_keyword(arg_raw)
+    if day_err or not target_day:
+        await update.message.reply_text(
+            day_err or "Cú pháp: /tomtat nay | mai | sáng nay | chiều mai | 26/03"
+        )
+        return
+    tod = extract_time_of_day(arg_raw)
+
+    chat_id = update.effective_chat.id
+    email, refresh, name, profile_err = get_user_calendar_profile(sb, chat_id)
+    if profile_err:
+        await update.message.reply_text(profile_err)
+        return
+
+    await update.message.chat.send_action("typing")
+    try:
+        events, err = await run_blocking(
+            fetch_calendar_events_for_day,
+            email or "",
+            target_day,
+            GCALENDAR_TZ,
+            refresh,
+        )
+    except Exception as e:
+        logger.exception("cmd_tomtat fetch: %s", e)
+        await update.message.reply_text(f"Lấy lịch lỗi: {e}{calendar_oauth_revoked_hint(e)}")
+        return
+    if err:
+        await update.message.reply_text(f"Lấy lịch lỗi: {err}{calendar_oauth_revoked_hint(err)}")
+        return
+
+    ev_list = _filter_events_by_time_of_day(events or [], tod, GCALENDAR_TZ)
+    if not ev_list:
+        range_label = arg_raw or "hôm nay"
+        await update.message.reply_text(
+            f"Không có cuộc họp nào ({range_label}) trên Google Calendar."
+        )
+        return
+
+    day_str = target_day.strftime("%d/%m/%Y")
+    tod_label = ""
+    if tod:
+        h_s, h_e = tod
+        tod_label = f" ({h_s:02d}h–{h_e:02d}h)"
+
+    header = f"Tóm tắt các cuộc họp ngày {day_str}{tod_label} — {len(ev_list)} cuộc:\n"
+    if name:
+        header = f"Chào {name},\n\n" + header
+    await update.message.reply_text(header)
+
+    members = await run_blocking(fetch_members_snapshot, sb)
+
+    # Parallel LLM + Google Calendar fetch — mỗi cuộc 1 coroutine.
+    results = await asyncio.gather(
+        *[_summarize_one_event(email or "", refresh, ev, members, GCALENDAR_TZ) for ev in ev_list],
+        return_exceptions=True,
+    )
+
+    all_tasks: List[Dict[str, Any]] = []
+    for i, res in enumerate(results, 1):
+        ev_src = ev_list[i - 1]
+        title = (ev_src.get("summary") or "(Không tiêu đề)").strip()
+        try:
+            _is_all, st, _en, _loc = parse_google_start_end(ev_src, GCALENDAR_TZ)
+            time_str = "cả ngày" if _is_all else st.strftime("%H:%M")
+        except Exception:
+            time_str = ""
+        head = f"[{i}] {time_str} — {title}" if time_str else f"[{i}] {title}"
+
+        if isinstance(res, Exception):
+            await _send_long_text(update.effective_chat, f"{head}\nLỗi xử lý: {res}")
+            continue
+
+        if res.get("error"):
+            await _send_long_text(update.effective_chat, f"{head}\nLỗi: {res['error']}")
+            continue
+
+        full_ev = res["event"]
+        if res.get("no_minutes"):
+            await _send_long_text(
+                update.effective_chat,
+                f"{head}\n(Cuộc họp chưa có biên bản trong mô tả — bỏ qua tóm tắt.)",
+            )
+            continue
+
+        summary_dict = res.get("summary_dict") or {}
+        tasks = res.get("tasks") or []
+        if tasks:
+            tasks = await run_blocking(resolve_assignees, sb, tasks, members)
+            eid = (full_ev.get("id") or "").strip()
+            if eid and not await run_blocking(has_saved_tasks_for_event, sb, eid):
+                try:
+                    await run_blocking(
+                        save_meeting_tasks, sb, full_ev, tasks, chat_id, GCALENDAR_TZ
+                    )
+                except Exception as e:
+                    logger.warning("cmd_tomtat save_meeting_tasks: %s", e)
+            for t in tasks:
+                t["_meeting_title"] = title
+                all_tasks.append(t)
+
+        parts: List[str] = [head]
+        summary_text = format_summary_section(summary_dict)
+        if summary_text:
+            parts.append(summary_text)
+        else:
+            parts.append("(Không tóm tắt được nội dung.)")
+        if tasks:
+            # Chỉ tên + assignee cho từng cuộc (chi tiết đã nằm ở bảng tổng hợp).
+            tks = [
+                f"   - {t.get('task_name') or '(không có)'}"
+                for t in tasks
+            ]
+            parts.append("Công việc:")
+            parts.extend(tks)
+        await _send_long_text(update.effective_chat, "\n".join(parts))
+
+    # Bảng tổng hợp cuối.
+    await _send_long_text(update.effective_chat, _format_aggregated_tasks(all_tasks))

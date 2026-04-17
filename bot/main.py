@@ -19,10 +19,9 @@ from .config import OPENAI_API_KEY, TELEGRAM_BOT_TOKEN
 from .handlers.basic import cmd_clear, cmd_id, cmd_model, cmd_start, cmd_think
 from .handlers.calendar_cmd import (
     MEET_PICK_PREFIX,
-    MEET_SUM_PREFIX,
     cmd_lich,
+    cmd_tomtat,
     on_meeting_pick_callback,
-    on_meeting_summarize_callback,
 )
 from .handlers.capture import capture_incoming_update
 from .handlers.chat import handle_message
@@ -70,12 +69,12 @@ def main() -> None:
     app.add_handler(dk_conv)
     app.add_handler(CallbackQueryHandler(registration_callback, pattern=r"^reg:(approve|reject):"))
     app.add_handler(CallbackQueryHandler(on_meeting_pick_callback, pattern=rf"^{MEET_PICK_PREFIX}"))
-    app.add_handler(CallbackQueryHandler(on_meeting_summarize_callback, pattern=rf"^{MEET_SUM_PREFIX}"))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("lich", cmd_lich))
+    app.add_handler(CommandHandler("tomtat", cmd_tomtat))
     app.add_handler(CommandHandler("think", cmd_think))
     app.add_handler(CommandHandler("tables", cmd_tables))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
