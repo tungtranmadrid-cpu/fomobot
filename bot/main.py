@@ -25,8 +25,6 @@ from .handlers.calendar_cmd import (
 )
 from .handlers.capture import capture_incoming_update
 from .handlers.chat import handle_message
-from .handlers.db_cmd import cmd_query, cmd_refresh, cmd_tables
-from .handlers.rag_cmd import cmd_ask, cmd_rag_index
 from .handlers.registration import (
     REG_EMAIL,
     REG_USERNAME,
@@ -76,11 +74,6 @@ def main() -> None:
     app.add_handler(CommandHandler("lich", cmd_lich))
     app.add_handler(CommandHandler("tomtat", cmd_tomtat))
     app.add_handler(CommandHandler("think", cmd_think))
-    app.add_handler(CommandHandler("tables", cmd_tables))
-    app.add_handler(CommandHandler("refresh", cmd_refresh))
-    app.add_handler(CommandHandler("query", cmd_query))
-    app.add_handler(CommandHandler("rag_index", cmd_rag_index))
-    app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot đang chạy...")

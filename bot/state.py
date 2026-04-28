@@ -12,9 +12,6 @@ logger = logging.getLogger(__name__)
 # chat_id -> list messages (role/content)
 user_conversations: Dict[int, List[dict]] = {}
 
-# chat_id -> list {question, sql, answer}
-query_history: Dict[int, List[dict]] = {}
-
 # chat_id -> True/False (chế độ reasoning)
 user_thinking: Dict[int, bool] = {}
 
@@ -33,7 +30,7 @@ async def ensure_state_loaded(chat_id: int) -> None:
     try:
         r = await run_blocking(
             lambda: sb.table(SUPABASE_STATE_TABLE)
-            .select("conversation,query_history,thinking")
+            .select("conversation,thinking")
             .eq("chat_id", chat_id)
             .limit(1)
             .execute()
@@ -42,11 +39,8 @@ async def ensure_state_loaded(chat_id: int) -> None:
         if rows:
             row = rows[0]
             conv = row.get("conversation")
-            qh = row.get("query_history")
             if isinstance(conv, list):
                 user_conversations[chat_id] = conv
-            if isinstance(qh, list):
-                query_history[chat_id] = qh
             user_thinking[chat_id] = bool(row.get("thinking"))
     except Exception as e:
         logger.debug("load state %s: %s", chat_id, e)
@@ -60,7 +54,6 @@ def schedule_save_state(chat_id: int) -> None:
     payload = {
         "chat_id": chat_id,
         "conversation": user_conversations.get(chat_id, []),
-        "query_history": query_history.get(chat_id, []),
         "thinking": user_thinking.get(chat_id, False),
     }
 

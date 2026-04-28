@@ -1,4 +1,4 @@
-"""Factory cho OpenAI (chat + embedding) và Supabase client."""
+"""Factory cho OpenAI (chat) và Supabase client."""
 import logging
 from typing import Any, Optional
 
@@ -7,8 +7,6 @@ from openai import OpenAI
 from .config import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
-    OPENAI_EMBEDDING_API_KEY,
-    OPENAI_EMBEDDING_BASE_URL,
     SUPABASE_KEY,
     SUPABASE_URL,
 )
@@ -28,16 +26,6 @@ def get_openai_client() -> OpenAI:
     if OPENAI_BASE_URL:
         kwargs["base_url"] = OPENAI_BASE_URL
     return OpenAI(**kwargs)
-
-
-def get_embedding_client() -> Optional[OpenAI]:
-    """Client chỉ cho embedding (OpenAI). Dùng OPENAI_EMBEDDING_API_KEY riêng."""
-    if not OPENAI_EMBEDDING_API_KEY:
-        return None
-    return OpenAI(
-        api_key=OPENAI_EMBEDDING_API_KEY,
-        base_url=OPENAI_EMBEDDING_BASE_URL or "https://api.openai.com/v1",
-    )
 
 
 def get_supabase_client() -> Optional[Any]:

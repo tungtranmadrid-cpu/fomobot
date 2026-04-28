@@ -10,9 +10,8 @@ from ..config import (
     DAILY_CALENDAR_MINUTE,
     GCALENDAR_TZ,
     OPENAI_BASE_URL,
-    SUPABASE_RAG_BUCKET,
 )
-from ..state import query_history, schedule_save_state, user_conversations, user_thinking
+from ..state import schedule_save_state, user_conversations, user_thinking
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -32,22 +31,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     if get_supabase_client():
         lines.append("/dk - Đăng ký tự động (username + email công ty), chờ admin duyệt.")
-        lines.append("/query <câu hỏi> - Truy vấn CSDL bằng ngôn ngữ tự nhiên.")
-        lines.append("/tables - Xem cấu trúc CSDL (bảng, cột).")
-        lines.append("/refresh - Cập nhật lại cache schema.")
         lines.append("/id - Xem Chat ID (để thêm vào bảng user / lịch Google Calendar).")
-    if get_supabase_client() and SUPABASE_RAG_BUCKET:
-        lines.append("/rag_index - Index file trong Supabase Storage vào RAG.")
-        lines.append("/ask <câu hỏi> - Trả lời dựa trên tài liệu đã index (RAG).")
     await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     user_conversations.pop(chat_id, None)
-    query_history.pop(chat_id, None)
     schedule_save_state(chat_id)
-    await update.message.reply_text("Đã xóa lịch sử hội thoại và lịch sử truy vấn.")
+    await update.message.reply_text("Đã xóa lịch sử hội thoại.")
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -55,7 +47,6 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cid = update.effective_chat.id
     chat_type = update.effective_chat.type
     user = update.effective_user
-    # Không dùng Markdown/HTML: username có dấu _ hoặc ký tự đặc biệt sẽ làm Telegram báo lỗi parse entity.
     parts = [f"Chat ID: {cid}"]
     if user and user.username:
         parts.append(f"Username: @{user.username}")

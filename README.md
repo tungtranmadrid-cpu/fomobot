@@ -148,32 +148,7 @@ Khi sự kiện Google Calendar có **biên bản họp** trong phần mô tả 
 4. Bot **lưu vào** bảng `meeting_tasks` (dedup theo `meeting_event_id`).
 5. Hiển thị bảng tổng hợp công việc từ tất cả cuộc họp trong ngày.
 
-### 5. Truy vấn CSDL bằng ngôn ngữ tự nhiên (Text-to-SQL)
-`/query <câu hỏi>`
-
-Pipeline 2 bước:
-1. **AI sinh SQL** từ câu hỏi + schema CSDL thực + lịch sử hội thoại.
-2. **Chạy SQL** qua RPC `execute_readonly_sql` (chỉ SELECT, read-only transaction, timeout 5s).
-3. **AI tổng hợp** kết quả thành câu trả lời tiếng Việt tự nhiên có so sánh context.
-
-Bảo mật:
-- SQL được strip comment, kiểm tra chỉ cho phép SELECT/WITH.
-- Role `bot_readonly` chỉ có quyền SELECT.
-- `SET LOCAL transaction_read_only = on` — Postgres từ chối mọi thao tác ghi.
-
-### 6. RAG — Hỏi đáp tài liệu nội bộ
-- `/rag_index` — quét Supabase Storage (PDF + text), chunk, tạo embedding, lưu `rag_chunks`.
-- `/ask <câu hỏi>` — tìm chunks liên quan (vector search ưu tiên, fallback keyword), AI trả lời dựa trên context tài liệu.
-
-Pipeline:
-1. Tải file từ Supabase Storage.
-2. Trích text (PDF qua PyMuPDF, text decode tự động encoding).
-3. Chia chunks (configurable: size 800, overlap 100).
-4. Tạo embedding (OpenAI `text-embedding-3-small`, batch 50).
-5. Insert vào `rag_chunks` (pgvector + HNSW index).
-6. Tìm kiếm: cosine similarity hoặc keyword fallback (`pg_trgm`).
-
-### 7. Đăng ký người dùng (`/dk`)
+### 5. Đăng ký người dùng (`/dk`)
 ConversationHandler 2 bước (chỉ trong chat riêng):
 1. Nhập Username → nhập email công ty.
 2. Bot gửi yêu cầu tới tất cả admin (inline button Duyệt/Từ chối).
@@ -181,12 +156,12 @@ ConversationHandler 2 bước (chỉ trong chat riêng):
 
 Kiểm tra: chống đăng ký trùng, validate email, chỉ admin mới duyệt được.
 
-### 8. Quản lý trạng thái
-- **RAM cache** per chat_id: lịch sử hội thoại, lịch sử query SQL, chế độ thinking.
+### 6. Quản lý trạng thái
+- **RAM cache** per chat_id: lịch sử hội thoại, chế độ thinking.
 - **Sync Supabase** (`bot_state`): upsert fire-and-forget mỗi khi state thay đổi.
 - **Load on demand**: lần đầu chat sẽ nạp state từ DB, các lần sau dùng RAM.
 
-### 9. Logging & Rate limiting
+### 7. Logging & Rate limiting
 - Mọi tin nhắn vào/ra đều được ghi vào `telegram_chat_logs` (LoggingBot).
 - Token bucket rate limiter: mặc định 20 tin/phút, burst 5.
 
@@ -200,15 +175,9 @@ Schema khởi tạo bằng `QUERY_SETUP.sql`:
 |---|---|
 | `user` | Thông tin user: username, email công ty, telegram_ID, gcal_refresh_token, Role |
 | `members` | Danh sách nhân sự: họ tên, chức vụ, nơi làm việc, email |
-| `bot_state` | State per chat_id: conversation history, query history, thinking mode |
+| `bot_state` | State per chat_id: conversation history, thinking mode |
 | `telegram_chat_logs` | Log toàn bộ tin nhắn vào/ra bot |
-| `rag_chunks` | Chunks tài liệu + embedding vector (pgvector 1536 chiều) |
 | `meeting_tasks` | Công việc trích từ biên bản cuộc họp |
-| `get_schema_info()` | RPC: trả schema thực (bảng, cột, kiểu dữ liệu) |
-| `execute_readonly_sql(query)` | RPC: chạy SELECT an toàn (read-only) |
-| `search_rag_by_embedding(emb, k)` | RPC: vector similarity search |
-| `search_rag_chunks(keywords, k)` | RPC: keyword fulltext search (fallback) |
-| `truncate_rag_chunks()` | RPC: xóa toàn bộ chunks trước khi re-index |
 
 ---
 
@@ -278,15 +247,11 @@ GCAL_MASTER_REFRESH_TOKEN=...
 | `AI_MODEL` | | Model chat (mặc định: `gpt-4o-mini` / `deepseek-chat`) |
 | `SUPABASE_URL` | ✅ | URL project Supabase |
 | `SUPABASE_KEY` | ✅ | Service role key Supabase |
-| `OPENAI_EMBEDDING_API_KEY` | | API key riêng cho embedding (RAG) |
-| `EMBEDDING_MODEL` | | `text-embedding-3-small` (mặc định) |
 | `GCALENDAR_TZ` | | Timezone (mặc định: `Asia/Ho_Chi_Minh`) |
 | `DAILY_CALENDAR_HOUR` | | Giờ gửi nhắc lịch (mặc định: `7`) |
 | `DAILY_CALENDAR_MINUTE` | | Phút gửi nhắc lịch (mặc định: `0`) |
 | `DEFAULT_REGISTRATION_USEREMAIL` | | Email mặc định khi admin duyệt `/dk` |
 | `RATE_LIMIT_PER_MINUTE` | | Giới hạn tin/phút (mặc định: `20`) |
-| `RAG_CHUNK_SIZE` | | Kích thước chunk (mặc định: `800`) |
-| `RAG_TOP_K` | | Số chunks trả về khi search (mặc định: `8`) |
 
 ---
 
@@ -295,16 +260,11 @@ GCAL_MASTER_REFRESH_TOKEN=...
 | Lệnh | Mô tả |
 |---|---|
 | `/start` | Lời chào + danh sách lệnh khả dụng |
-| `/clear` | Xóa lịch sử hội thoại và lịch sử query |
+| `/clear` | Xóa lịch sử hội thoại |
 | `/id` | Xem Chat ID (để thêm vào bảng `user`) |
 | `/model` | Xem model AI và base URL đang dùng |
 | `/think` | Bật/tắt chế độ suy nghĩ từng bước |
 | `/lich [ngày]` | Xem lịch Google Calendar theo ngày |
 | `/tomtat [ngày]` | Tóm tắt biên bản + tổng hợp công việc từ cuộc họp |
-| `/query <câu hỏi>` | Truy vấn Supabase bằng ngôn ngữ tự nhiên |
-| `/tables` | Xem cấu trúc CSDL (bảng, cột) |
-| `/refresh` | Cập nhật lại cache schema |
-| `/rag_index` | Index tài liệu từ Supabase Storage vào RAG |
-| `/ask <câu hỏi>` | Hỏi đáp dựa trên tài liệu đã index |
 | `/dk` | Đăng ký tham gia hệ thống (chờ admin duyệt) |
-| `/cancel` | Hủy đang ký `/dk` |
+| `/cancel` | Hủy đăng ký `/dk` |

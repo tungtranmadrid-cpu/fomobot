@@ -24,18 +24,9 @@ _default_model = (
 )
 AI_MODEL = os.getenv("AI_MODEL", _default_model).strip() or _default_model
 
-# ---- Embedding (RAG) ----
-OPENAI_EMBEDDING_API_KEY = (os.getenv("OPENAI_EMBEDDING_API_KEY") or "").strip() or None
-OPENAI_EMBEDDING_BASE_URL = (
-    (os.getenv("OPENAI_EMBEDDING_BASE_URL") or "").strip() or "https://api.openai.com/v1"
-)
-EMBEDDING_MODEL = (os.getenv("EMBEDDING_MODEL") or "text-embedding-3-small").strip()
-
 # ---- Supabase ----
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip() or None
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip() or None
-SUPABASE_RAG_BUCKET = (os.getenv("SUPABASE_RAG_BUCKET") or "documents").strip()
-SUPABASE_RAG_TABLE = (os.getenv("SUPABASE_RAG_TABLE") or "rag_chunks").strip()
 SUPABASE_CHAT_LOG_TABLE = (
     (os.getenv("SUPABASE_CHAT_LOG_TABLE") or "telegram_chat_logs").strip()
     or "telegram_chat_logs"
@@ -70,12 +61,5 @@ DEFAULT_REGISTRATION_GCAL_REFRESH = (
 RATE_LIMIT_PER_MINUTE = max(1, int(os.getenv("RATE_LIMIT_PER_MINUTE", "20")))
 RATE_LIMIT_BURST = max(1, int(os.getenv("RATE_LIMIT_BURST", "5")))
 
-# ---- RAG tuning ----
-RAG_CHUNK_SIZE = max(100, min(2000, int(os.getenv("RAG_CHUNK_SIZE", "800"))))
-RAG_CHUNK_OVERLAP = max(0, min(200, int(os.getenv("RAG_CHUNK_OVERLAP", "100"))))
-RAG_TOP_K = max(1, min(20, int(os.getenv("RAG_TOP_K", "8"))))
-RAG_EMBEDDING_BATCH = max(1, min(100, int(os.getenv("RAG_EMBEDDING_BATCH", "50"))))
-
 # ---- Conversation history ----
 MAX_HISTORY = 20
-MAX_QUERY_HISTORY = 10
