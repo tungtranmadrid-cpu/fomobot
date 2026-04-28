@@ -2,7 +2,7 @@
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from ..calendar.fetch import gcalendar_ready
+from ..cal.db_fetch import db_calendar_ready
 from ..clients import get_supabase_client
 from ..config import (
     AI_MODEL,
@@ -15,23 +15,24 @@ from ..state import schedule_save_state, user_conversations, user_thinking
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sb = get_supabase_client()
     lines = [
         "Chào! Gửi tin nhắn để chat với AI.",
         "/clear - Xóa lịch sử hội thoại.",
         "/model - Xem model đang dùng.",
         "/think - Bật/tắt chế độ suy nghĩ (reasoning): AI sẽ trình bày bước suy luận trước khi trả lời.",
     ]
-    if gcalendar_ready():
+    if db_calendar_ready(sb):
         lines.append(
-            f"(Bot sẽ gửi lịch Google Calendar mỗi ngày khoảng {DAILY_CALENDAR_HOUR:02d}:{DAILY_CALENDAR_MINUTE:02d} giờ {GCALENDAR_TZ} nếu bạn có trong Supabase.)"
+            f"(Bot sẽ gửi lịch mỗi ngày khoảng {DAILY_CALENDAR_HOUR:02d}:{DAILY_CALENDAR_MINUTE:02d} giờ {GCALENDAR_TZ} nếu bạn có trong Supabase.)"
         )
-        lines.append("/lich <nay|mai> - Xem lịch Google Calendar đã qua AI duyệt.")
+        lines.append("/lich <nay|mai> - Xem lịch đã tổng hợp từ MS Teams / Google Calendar.")
         lines.append(
-            "Chi tiết cuộc họp: hỏi thành viên / tài liệu / link (kèm ngày nếu cần) — bot lấy từ Google Calendar."
+            "Chi tiết cuộc họp: hỏi thành viên / tài liệu / link (kèm ngày nếu cần)."
         )
-    if get_supabase_client():
+    if sb:
         lines.append("/dk - Đăng ký tự động (username + email công ty), chờ admin duyệt.")
-        lines.append("/id - Xem Chat ID (để thêm vào bảng user / lịch Google Calendar).")
+        lines.append("/id - Xem Chat ID (để thêm vào bảng user).")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -44,10 +45,10 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Chat ID dùng cho cột telegram_ID trong bảng user (Supabase)."""
-    cid = update.effective_chat.id
+    cid       = update.effective_chat.id
     chat_type = update.effective_chat.type
-    user = update.effective_user
-    parts = [f"Chat ID: {cid}"]
+    user      = update.effective_user
+    parts     = [f"Chat ID: {cid}"]
     if user and user.username:
         parts.append(f"Username: @{user.username}")
     if chat_type == "private":
@@ -56,16 +57,14 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "khi thêm dòng trong bảng user trên Supabase."
         )
     else:
-        parts.append(
-            "Đây là ID nhóm/kênh. Lịch cá nhân thường cấu hình bằng Chat ID lấy từ tin nhắn riêng với bot."
-        )
+        parts.append("Đây là ID nhóm/kênh.")
     await update.message.reply_text("\n".join(parts))
 
 
 async def cmd_think(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bật/tắt chế độ thinking: AI suy nghĩ từng bước trước khi trả lời."""
-    chat_id = update.effective_chat.id
-    current = user_thinking.get(chat_id, False)
+    chat_id   = update.effective_chat.id
+    current   = user_thinking.get(chat_id, False)
     user_thinking[chat_id] = not current
     new_state = user_thinking[chat_id]
     schedule_save_state(chat_id)

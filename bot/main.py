@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from .calendar.reminder import post_init_schedule
+from .cal.reminder import post_init_schedule
 from .chat_log import LoggingBot
 from .config import OPENAI_API_KEY, TELEGRAM_BOT_TOKEN
 from .handlers.basic import cmd_clear, cmd_id, cmd_model, cmd_start, cmd_think

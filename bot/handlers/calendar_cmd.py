@@ -15,26 +15,26 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo  # type: ignore
 
 from ..async_utils import run_blocking
-from ..calendar.db_fetch import (
+from ..cal.db_fetch import (
     db_calendar_ready,
     fetch_event_by_id,
     fetch_events_for_user_date,
 )
-from ..calendar.format import (
+from ..cal.format import (
     fetch_members_by_emails,
     format_day_schedule,
     format_meeting_details_text,
     is_hidden_meeting_report_email,
     parse_google_start_end,
 )
-from ..calendar.intent import (
+from ..cal.intent import (
     extract_time_of_day,
     resolve_day_for_meeting_query,
     resolve_day_keyword,
     select_event_index_by_ai,
 )
-from ..calendar.profile import get_user_db_profile
-from ..calendar.tasks import (
+from ..cal.profile import get_user_db_profile
+from ..cal.tasks import (
     fetch_members_snapshot,
     format_summary_section,
     format_tasks_table,

@@ -4,7 +4,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from ..calendar.intent import (
+from ..cal.intent import (
     is_calendar_intent,
     is_meeting_detail_intent,
     resolve_day_keyword,
