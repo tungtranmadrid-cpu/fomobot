@@ -173,7 +173,7 @@ def format_day_schedule(
     display_tz: str = "Asia/Ho_Chi_Minh",
 ) -> str:
     if not events:
-        return f"Lịch ngày {day.strftime('%d/%m/%Y')}: không có sự kiện trên Google Calendar."
+        return f"Lịch ngày {day.strftime('%d/%m/%Y')}: không có sự kiện."
 
     lines: List[str] = [f"Lịch ngày {day.strftime('%d/%m/%Y')} (giờ {display_tz}):"]
     for ev in events:
@@ -247,10 +247,7 @@ def format_meeting_details_text(
                 "  (Không hiển thị danh sách theo cấu hình ẩn email hoặc chỉ có email đã ẩn.)"
             )
     else:
-        lines.append(
-            "Thành phần tham gia: không có danh sách trên Google Calendar "
-            "(sự kiện cá nhân hoặc chưa mời qua Calendar)."
-        )
+        lines.append("Thành phần tham gia: (không có danh sách người tham dự)")
 
     online_lines: List[str] = []
     doc_lines: List[str] = []
@@ -321,7 +318,7 @@ def format_meeting_details_text(
         desc_text = html_description_to_text(desc)
         if desc_text:
             lines.append("")
-            lines.append("Mô tả / biên bản cuộc họp (từ Google Calendar):")
+            lines.append("Mô tả / biên bản cuộc họp:")
             lines.append(desc_text)
 
     return "\n".join(lines)
